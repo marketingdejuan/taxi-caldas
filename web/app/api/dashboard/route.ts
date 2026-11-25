@@ -18,17 +18,24 @@ export async function GET() {
         data_consent BOOLEAN DEFAULT FALSE,
         data_consent_at TIMESTAMP WITH TIME ZONE,
         trips_count INTEGER DEFAULT 0,
+        rating_avg NUMERIC(3,2) DEFAULT 5.00,
+        rating_count INTEGER DEFAULT 0,
         last_interaction_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
       ALTER TABLE passengers ADD COLUMN IF NOT EXISTS data_consent BOOLEAN DEFAULT FALSE;
       ALTER TABLE passengers ADD COLUMN IF NOT EXISTS data_consent_at TIMESTAMP WITH TIME ZONE;
+      ALTER TABLE passengers ADD COLUMN IF NOT EXISTS rating_avg NUMERIC(3,2) DEFAULT 5.00;
+      ALTER TABLE passengers ADD COLUMN IF NOT EXISTS rating_count INTEGER DEFAULT 0;
       ALTER TABLE drivers ADD COLUMN IF NOT EXISTS profile_photo_path TEXT;
       ALTER TABLE drivers ADD COLUMN IF NOT EXISTS data_consent BOOLEAN DEFAULT FALSE;
       ALTER TABLE drivers ADD COLUMN IF NOT EXISTS data_consent_at TIMESTAMP WITH TIME ZONE;
       ALTER TABLE trips ADD COLUMN IF NOT EXISTS dropoff_address TEXT;
       ALTER TABLE trips ADD COLUMN IF NOT EXISTS distance_km NUMERIC(6,2);
       ALTER TABLE trips ADD COLUMN IF NOT EXISTS estimated_fare INTEGER;
+      ALTER TABLE trips ADD COLUMN IF NOT EXISTS passenger_comment TEXT;
+      ALTER TABLE trips ADD COLUMN IF NOT EXISTS driver_rating INTEGER;
+      ALTER TABLE trips ADD COLUMN IF NOT EXISTS driver_comment TEXT;
     `);
 
     const [driversRes, tripsRes, revenueRes, sosRes, passengersRes] =
@@ -69,6 +76,9 @@ export async function GET() {
             t.estimated_fare,
             t.status,
             t.rating,
+            t.passenger_comment,
+            t.driver_rating,
+            t.driver_comment,
             t.cancelled_by,
             t.created_at,
             t.accepted_at,
@@ -124,6 +134,8 @@ export async function GET() {
             data_consent,
             data_consent_at,
             trips_count,
+            rating_avg,
+            rating_count,
             last_interaction_at,
             created_at
           FROM passengers

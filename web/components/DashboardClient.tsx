@@ -86,6 +86,9 @@ interface Trip {
   estimated_fare: number | null;
   status: string;
   rating: number | null;
+  passenger_comment: string | null;
+  driver_rating: number | null;
+  driver_comment: string | null;
   cancelled_by: string | null;
   created_at: string;
   driver_name: string | null;
@@ -846,7 +849,23 @@ export default function DashboardClient() {
                         ({trip.passenger_phone})
                       </span>
                     </p>
-                    {trip.dropoff_address && (
+                    {(trip.rating || trip.driver_rating || trip.passenger_comment || trip.driver_comment) && (
+              <div className="rounded-lg bg-amber-50 border border-amber-200 px-2.5 py-1.5 text-[11px] text-slate-800 space-y-0.5">
+                {trip.rating && (
+                  <p>
+                    <strong>👤 Usuario calificó ({trip.rating}⭐):</strong>{" "}
+                    {trip.passenger_comment || "Sin comentario adicional"}
+                  </p>
+                )}
+                {trip.driver_rating && (
+                  <p>
+                    <strong>🚕 Taxista calificó ({trip.driver_rating}⭐):</strong>{" "}
+                    {trip.driver_comment || "Sin comentario adicional"}
+                  </p>
+                )}
+              </div>
+            )}
+            {trip.dropoff_address && (
                       <p className="mt-0.5 text-[11px] text-slate-600 truncate">
                         🏁 {trip.dropoff_address} •{' '}
                         <strong className="text-emerald-700">
@@ -933,6 +952,7 @@ export default function DashboardClient() {
                       <th className="px-4 py-3">Usuario</th>
                       <th className="px-4 py-3">Destino / Tarifa</th>
                       <th className="px-4 py-3">Taxista</th>
+                      <th className="px-4 py-3">Calif. / Reseñas</th>
                       <th className="px-4 py-3">Estado</th>
                       <th className="px-4 py-3">Chat</th>
                     </tr>
@@ -982,6 +1002,27 @@ export default function DashboardClient() {
                             </>
                           ) : (
                             <span className="text-slate-400">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-xs space-y-0.5">
+                          <div>
+                            {trip.rating ? (
+                              <span className="font-semibold text-slate-800">
+                                👤→🚕 {trip.rating}⭐
+                              </span>
+                            ) : (
+                              <span className="text-slate-400">👤→🚕 —</span>
+                            )}
+                            {trip.driver_rating && (
+                              <span className="ml-2 font-semibold text-amber-800">
+                                🚕→👤 {trip.driver_rating}⭐
+                              </span>
+                            )}
+                          </div>
+                          {trip.passenger_comment && (
+                            <p className="text-[11px] text-slate-500 max-w-[160px] truncate" title={trip.passenger_comment}>
+                              "{trip.passenger_comment}"
+                            </p>
                           )}
                         </td>
                         <td className="px-4 py-3">

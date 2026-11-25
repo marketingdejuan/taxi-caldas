@@ -170,17 +170,19 @@ function isConsentRejected(upperText: string): boolean {
 
 function isQuoteIntent(upperText: string): boolean {
   const clean = normalizeSearchKey(upperText);
-  return [
-    'COTIZAR',
-    'COTIZACION',
-    'TARIFA',
-    'TARIFAS',
-    'PRECIO',
-    'CUANTO VALE',
-    'CUANTO CUESTA',
-    'VALOR CARRERA',
-    'SIMULAR',
-  ].includes(clean) || clean.startsWith('COTIZAR ');
+  return (
+    [
+      'COTIZAR',
+      'COTIZACION',
+      'TARIFA',
+      'TARIFAS',
+      'PRECIO',
+      'CUANTO VALE',
+      'CUANTO CUESTA',
+      'VALOR CARRERA',
+      'SIMULAR',
+    ].includes(clean) || clean.startsWith('COTIZAR ')
+  );
 }
 
 function isAmbiguousTaxiOrDriverIntent(upperText: string): boolean {
@@ -304,7 +306,6 @@ async function resolvePlaceToCoords(rawPlace: string): Promise<GeoPoint | null> 
       };
     }
 
-    // Segundo intento en todo el Valle de Aburrá / Antioquia
     const fallbackRes = await axios.get('https://nominatim.openstreetmap.org/search', {
       params: {
         q: `${rawPlace.trim()}, Antioquia, Colombia`,
@@ -356,9 +357,7 @@ async function calculateRouteQuote(
       distanceMeters = Number(route.distance);
       durationSeconds = Number(route.duration || 0);
     }
-  } catch {
-    // Fallback vial urbano si OSRM no responde a tiempo
-  }
+  } catch {}
 
   if (distanceMeters <= 0) {
     const straight = haversineMeters(
@@ -383,6 +382,7 @@ async function calculateRouteQuote(
 function calculateEtaEstimate(distanceMeters: number | null | undefined): {
   rangeText: string;
   distanceText: string;
+  minMins: number;
 } {
   if (
     distanceMeters == null ||
@@ -392,6 +392,7 @@ function calculateEtaEstimate(distanceMeters: number | null | undefined): {
     return {
       rangeText: '5 a 8 minutos',
       distanceText: 'Cerca de tu ubicación',
+      minMins: 5,
     };
   }
   const dist = Math.round(Number(distanceMeters));
@@ -403,6 +404,7 @@ function calculateEtaEstimate(distanceMeters: number | null | undefined): {
   return {
     rangeText: `${minMins} a ${maxMins} minutos`,
     distanceText,
+    minMins,
   };
 }
 
@@ -447,6 +449,232 @@ async function getRuntimeConfig() {
     };
   }
 }
+
+// Enviar mensaje bilateral de seguimiento para confirmar si el viaje continúa o terminó
+async function sendTripProgressCheckIn(tripId: number, reasonLabel?: string) {
+  const tripRes = await db.query(
+    `SELECT
+       t.id,
+       t.status,
+       t.passenger_phone,
+       t.accepted_at,
+       t.followup_count,
+       COALESCE(p.full_name, dp.full_name, 'Usuario') AS passenger_name,
+       d.id AS driver_id,
+       d.phone AS driver_phone,
+       d.full_name AS driver_name,
+       d.plate AS driver_plate
+     FROM trips t
+     LEFT JOIN drivers d ON t.driver_id = d.id
+     LEFT JOIN passengers p ON t.passenger_phone = p.phone
+     LEFT JOIN drivers dp ON t.passenger_phone = dp.phone
+     WHERE t.id = $1`,
+    [tripId]
+  );
+
+  const trip = tripRes.rows[0];
+  if (!trip || trip.status !== 'ACTIVE' || !trip.driver_phone) return;
+
+  const round = Number(trip.followup_count || 0) + 1;
+  const sentLock = await redis.set(
+    `checkin:lock:${trip.id}:${round}`,
+    '1',
+    'EX',
+    540,
+    'NX'
+  );
+  if (!sentLock) return;
+
+  await db.query(
+    `UPDATE trips
+     SET followup_count = $2, last_followup_at = NOW()
+     WHERE id = $1`,
+    [trip.id, round]
+  );
+
+  const elapsedMins = trip.accepted_at
+    ? Math.max(
+        1,
+        Math.round((Date.now() - new Date(trip.accepted_at).getTime()) / 60000)
+      )
+    : 10;
+
+  const checkinState = JSON.stringify({
+    tripId: trip.id,
+    passengerPhone: trip.passenger_phone,
+    passengerName: trip.passenger_name,
+    driverId: trip.driver_id,
+    driverPhone: trip.driver_phone,
+    driverName: trip.driver_name,
+    plate: trip.driver_plate,
+  });
+
+  await redis.set(`trip_checkin:${trip.passenger_phone}`, checkinState, 'EX', 3600);
+  await redis.set(`trip_checkin:${trip.driver_phone}`, checkinState, 'EX', 3600);
+
+  const contextLine =
+    reasonLabel ||
+    `Han transcurrido *${elapsedMins} minutos* desde que inició el servicio.`;
+
+  await sendText(
+    trip.passenger_phone,
+    `🚖 *CENTRAL TAXI CALDAS • SEGUIMIENTO DE VIAJE #${trip.id}*\n\n` +
+      `Hola *${trip.passenger_name}*, ${contextLine}\n` +
+      `Por favor confírmanos cómo va tu recorrido con *${trip.driver_name}* (*${trip.driver_plate}*):\n\n` +
+      `*1* 👉 El viaje *AÚN CONTINÚA*\n` +
+      `*2* 👉 El viaje *YA TERMINÓ*`
+  );
+
+  await sendText(
+    trip.driver_phone,
+    `🚖 *CENTRAL TAXI CALDAS • SEGUIMIENTO DE VIAJE #${trip.id}*\n\n` +
+      `Hola *${trip.driver_name}*, ${contextLine}\n` +
+      `Por favor confírmanos el estado del servicio con *${trip.passenger_name}*:\n\n` +
+      `*1* 👉 El viaje *AÚN CONTINÚA*\n` +
+      `*2* 👉 El viaje *YA TERMINÓ*`
+  );
+}
+
+// Finalizar viaje (por FIN del taxista o confirmación "2" de cualquiera de los dos) y disparar calificación + comentario bilateral
+async function completeTripAndPromptRatings(
+  tripId: number,
+  closedByRole: 'DRIVER' | 'PASSENGER'
+) {
+  const tripRes = await db.query(
+    `UPDATE trips
+     SET status = 'COMPLETED', completed_at = NOW()
+     WHERE id = $1 AND status = 'ACTIVE'
+     RETURNING id, passenger_phone, driver_id`,
+    [tripId]
+  );
+
+  if (tripRes.rows.length === 0) return;
+  const trip = tripRes.rows[0];
+
+  const [drvRes, passRes, drvPassRes] = await Promise.all([
+    db.query(
+      `UPDATE drivers SET status = 'AVAILABLE' WHERE id = $1 RETURNING id, phone, full_name, plate`,
+      [trip.driver_id]
+    ),
+    db.query(`SELECT id, full_name FROM passengers WHERE phone = $1`, [
+      trip.passenger_phone,
+    ]),
+    db.query(`SELECT full_name FROM drivers WHERE phone = $1`, [
+      trip.passenger_phone,
+    ]),
+  ]);
+
+  const drv = drvRes.rows[0];
+  const passengerName =
+    passRes.rows[0]?.full_name || drvPassRes.rows[0]?.full_name || 'Usuario';
+
+  const keysToClear = [
+    `session:${trip.passenger_phone}`,
+    `trip:lock:${trip.id}`,
+    `trip_checkin:${trip.passenger_phone}`,
+  ];
+  if (drv?.phone) {
+    keysToClear.push(`session:${drv.phone}`, `trip_checkin:${drv.phone}`);
+  }
+  await redis.del(...keysToClear);
+
+  // Configurar encuesta bilateral: Usuario califica al Taxista, y Taxista califica al Usuario
+  if (drv) {
+    await redis.set(
+      `rate:${trip.passenger_phone}`,
+      JSON.stringify({
+        step: 'RATING',
+        tripId: trip.id,
+        raterRole: 'PASSENGER',
+        targetRole: 'DRIVER',
+        targetId: drv.id,
+        targetPhone: drv.phone,
+        targetName: drv.full_name,
+        plate: drv.plate,
+      }),
+      'EX',
+      3600
+    );
+
+    await redis.set(
+      `rate:${drv.phone}`,
+      JSON.stringify({
+        step: 'RATING',
+        tripId: trip.id,
+        raterRole: 'DRIVER',
+        targetRole: 'PASSENGER',
+        targetPhone: trip.passenger_phone,
+        targetName: passengerName,
+      }),
+      'EX',
+      3600
+    );
+  }
+
+  const closedByLabelForPassenger =
+    closedByRole === 'PASSENGER'
+      ? 'Confirmaste que tu viaje ha finalizado.'
+      : `El taxista *${drv?.full_name || ''}* marcó el viaje como finalizado.`;
+
+  const closedByLabelForDriver =
+    closedByRole === 'DRIVER'
+      ? 'Servicio finalizado. Quedas *DISPONIBLE* para nuevas carreras.'
+      : `El usuario *${passengerName}* confirmó que el viaje ha finalizado. Quedas *DISPONIBLE* para nuevas carreras.`;
+
+  await sendText(
+    trip.passenger_phone,
+    `🚖 *CENTRAL TAXI CALDAS • VIAJE #${trip.id} FINALIZADO*\n\n` +
+      `🏁 ${closedByLabelForPassenger}\n\n` +
+      `¿Cómo calificarías el servicio de *${drv?.full_name || 'tu taxista'}* (*${drv?.plate || ''}*)?\n` +
+      `Responde con un número del *1* al *5* (puedes incluir un comentario en el mismo mensaje, ej: *5 Excelente atención*):\n\n` +
+      `⭐⭐⭐⭐⭐ *5* - Excelente\n` +
+      `⭐⭐⭐⭐ *4* - Muy bueno\n` +
+      `⭐⭐⭐ *3* - Regular\n` +
+      `⭐⭐ *2* - Malo\n` +
+      `⭐ *1* - Muy malo\n\n` +
+      `_(O escribe *OMITIR* para saltar)_`
+  );
+
+  if (drv?.phone) {
+    await sendText(
+      drv.phone,
+      `🚖 *CENTRAL TAXI CALDAS • VIAJE #${trip.id} FINALIZADO*\n\n` +
+        `✅ ${closedByLabelForDriver}\n\n` +
+        `¿Cómo calificarías al usuario *${passengerName}*?\n` +
+        `Responde del *1* al *5* (puedes agregar un comentario, ej: *5 Excelente pasajero*) o escribe *OMITIR*:`
+    );
+  }
+}
+
+// Supervisor periódico cada 60s: revisa viajes ACTIVE cuyo tiempo estimado ya se cumplió
+setInterval(async () => {
+  try {
+    const dueTrips = await db.query(`
+      SELECT id
+      FROM trips
+      WHERE status = 'ACTIVE'
+        AND accepted_at IS NOT NULL
+        AND (
+          (
+            followup_count = 0
+            AND NOW() >= accepted_at + (GREATEST(8, COALESCE(duration_minutes, 12) + 5) * INTERVAL '1 minute')
+          )
+          OR (
+            followup_count > 0
+            AND followup_count < 4
+            AND last_followup_at IS NOT NULL
+            AND NOW() >= last_followup_at + INTERVAL '10 minutes'
+          )
+        )
+    `);
+
+    for (const row of dueTrips.rows) {
+      await sendTripProgressCheckIn(row.id);
+    }
+  } catch (err) {
+    console.error('⚠️ Error en supervisor de seguimiento de viajes:', err);
+  }
+}, 60_000);
 
 async function findAvailableDriversInRadius(
   lng: number,
@@ -591,6 +819,7 @@ async function dispatchTripFromPickup(params: {
   pickup: GeoPoint;
   dropoff?: GeoPoint | null;
   distanceKm?: number | null;
+  durationMinutes?: number | null;
   estimatedFare?: number | null;
   tripCommission: number;
 }) {
@@ -600,6 +829,7 @@ async function dispatchTripFromPickup(params: {
     pickup,
     dropoff,
     distanceKm,
+    durationMinutes,
     estimatedFare,
     tripCommission,
   } = params;
@@ -654,7 +884,7 @@ async function dispatchTripFromPickup(params: {
     const newTrip = await db.query(
       `INSERT INTO trips (
          passenger_phone, pickup_location, pickup_address,
-         dropoff_location, dropoff_address, distance_km, estimated_fare
+         dropoff_location, dropoff_address, distance_km, duration_minutes, estimated_fare
        )
        VALUES (
          $1,
@@ -665,7 +895,8 @@ async function dispatchTripFromPickup(params: {
               ELSE NULL END,
          $7,
          $8,
-         $9
+         $9,
+         $10
        )
        RETURNING id`,
       [
@@ -677,6 +908,7 @@ async function dispatchTripFromPickup(params: {
         dropoff ? dropoff.lat : null,
         dropoff ? dropoff.label : null,
         distanceKm ?? null,
+        durationMinutes ?? 12,
         estimatedFare ?? null,
       ]
     );
@@ -736,7 +968,6 @@ app.get(['/', '/health'], (_req, res) =>
   res.json({ ok: true, service: 'taxi-caldas-backend' })
 );
 
-// Endpoint interno para que el operador de Central Taxi Caldas envíe mensajes en un viaje
 app.post('/admin/send-trip-message', async (req, res) => {
   try {
     const { tripId, target, message } = req.body;
@@ -783,7 +1014,6 @@ app.post('/admin/send-trip-message', async (req, res) => {
   }
 });
 
-// Endpoint interno para borrar perfiles (conductores o clientes) y limpiar sesiones Redis
 app.post('/admin/delete-profile', async (req, res) => {
   try {
     const { type, id } = req.body;
@@ -807,6 +1037,8 @@ app.post('/admin/delete-profile', async (req, res) => {
         `reg:${drv.phone}`,
         `offer:${drv.phone}`,
         `session:${drv.phone}`,
+        `trip_checkin:${drv.phone}`,
+        `rate:${drv.phone}`,
         `driver_passenger_mode:${drv.phone}`,
         `role_confirm:${drv.phone}`,
         `quote:${drv.phone}`,
@@ -850,6 +1082,7 @@ app.post('/admin/delete-profile', async (req, res) => {
       `ask_name:${pass.phone}`,
       `rate:${pass.phone}`,
       `session:${pass.phone}`,
+      `trip_checkin:${pass.phone}`,
       `role_confirm:${pass.phone}`,
       `quote:${pass.phone}`,
       `pending_pickup:${pass.phone}`
@@ -863,7 +1096,6 @@ app.post('/admin/delete-profile', async (req, res) => {
   }
 });
 
-// Endpoint público para registro web de taxistas (/registro-taxista)
 app.post('/public/driver-register', async (req, res) => {
   try {
     const {
@@ -970,9 +1202,7 @@ app.post('/public/driver-register', async (req, res) => {
         cleanPhone,
         `🚖 *CENTRAL TAXI CALDAS:*\n✅ *¡Solicitud recibida, ${formattedName}!*\n\n🔢 Placa: *${cleanPlate}*\n🚕 Vehículo: *${cleanModel}*\n📋 Habeas Data: *Autorizado*\n\nRecibimos tu formulario web con foto de perfil y documentos. Te avisaremos por aquí en cuanto tu cuenta sea aprobada.`
       );
-    } catch (e) {
-      console.error('Aviso enviando confirmación WhatsApp web register:', e);
-    }
+    } catch {}
 
     const adminPhone = adminPhones[0];
     if (adminPhone) {
@@ -985,9 +1215,7 @@ app.post('/public/driver-register', async (req, res) => {
           'image/jpeg',
           summary
         );
-      } catch (e) {
-        console.error('Aviso notificando admin web register:', e);
-      }
+      } catch {}
     }
 
     res.json({ ok: true });
@@ -1037,6 +1265,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       ''
     ).trim();
     const upperText = text.toUpperCase();
+    const normalizedCmd = normalizeSearchKey(text);
     const location = msg.locationMessage || msg.liveLocationMessage;
     const imageMsg = msg.imageMessage;
     const videoMsg = msg.videoMessage;
@@ -1179,10 +1408,50 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       }
     }
 
-    // 1. MODO PROXY ENMASCARADO (VIAJE ACTIVO) CON TÍTULOS EXPLÍCITOS
+    // 1. MODO PROXY ENMASCARADO (VIAJE ACTIVO) + SEGUIMIENTO BILATERAL
     const activeSessionRaw = await redis.get(`session:${from}`);
     if (activeSessionRaw) {
       const session = JSON.parse(activeSessionRaw);
+
+      // Revisar si responde a una encuesta de seguimiento ("1" continúa / "2" ya terminó)
+      const checkinRaw = await redis.get(`trip_checkin:${from}`);
+      if (checkinRaw) {
+        const checkin = JSON.parse(checkinRaw);
+
+        if (
+          normalizedCmd === '1' ||
+          normalizedCmd === 'CONTINUA' ||
+          normalizedCmd === 'AUN CONTINUA' ||
+          normalizedCmd === 'EN CURSO' ||
+          normalizedCmd === 'SEGUIMOS'
+        ) {
+          await redis.del(
+            `trip_checkin:${checkin.passengerPhone}`,
+            `trip_checkin:${checkin.driverPhone}`
+          );
+          await db.query(
+            `UPDATE trips SET last_followup_at = NOW() WHERE id = $1`,
+            [checkin.tripId]
+          );
+          await sendText(
+            from,
+            `🚖 *CENTRAL TAXI CALDAS:*\n👍 ¡Gracias por confirmar! El viaje *#${checkin.tripId}* sigue activo. Te consultaremos nuevamente en *10 minutos* (o cuando el taxista escriba *FIN*).`
+          );
+          return;
+        }
+
+        if (
+          normalizedCmd === '2' ||
+          normalizedCmd === 'TERMINO' ||
+          normalizedCmd === 'YA TERMINO' ||
+          normalizedCmd === 'FINALIZADO' ||
+          normalizedCmd === 'FINALIZO' ||
+          normalizedCmd === 'FIN'
+        ) {
+          await completeTripAndPromptRatings(checkin.tripId, session.role);
+          return;
+        }
+      }
 
       if (upperText === 'SOS' || upperText.startsWith('SOS ')) {
         await db.query(
@@ -1283,7 +1552,9 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         await redis.del(
           `session:${from}`,
           `session:${session.peerPhone}`,
-          `trip:lock:${session.tripId}`
+          `trip:lock:${session.tripId}`,
+          `trip_checkin:${from}`,
+          `trip_checkin:${session.peerPhone}`
         );
 
         if (session.role === 'PASSENGER') {
@@ -1348,49 +1619,11 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         return;
       }
 
-      if (session.role === 'DRIVER' && upperText === 'FIN') {
-        await db.query(
-          `UPDATE trips SET status = 'COMPLETED', completed_at = NOW() WHERE id = $1`,
-          [session.tripId]
-        );
-        const drvRes = await db.query(
-          `UPDATE drivers SET status = 'AVAILABLE' WHERE phone = $1 RETURNING id, full_name, plate`,
-          [from]
-        );
-        const drv = drvRes.rows[0];
-
-        await redis.del(
-          `session:${from}`,
-          `session:${session.peerPhone}`,
-          `trip:lock:${session.tripId}`
-        );
-
-        if (drv) {
-          await redis.set(
-            `rate:${session.peerPhone}`,
-            JSON.stringify({
-              tripId: session.tripId,
-              driverId: drv.id,
-              driverName: drv.full_name,
-              plate: drv.plate,
-            }),
-            'EX',
-            3600
-          );
-        }
-
-        await sendText(
-          from,
-          '🚖 *CENTRAL TAXI CALDAS:*\n✅ Servicio finalizado. Quedas *DISPONIBLE* para nuevas carreras.'
-        );
-        await sendText(
-          session.peerPhone,
-          `🚖 *CENTRAL TAXI CALDAS:*\n🏁 *¡Tu viaje ha finalizado!*\n\n¿Cómo calificarías el servicio de *${drv?.full_name || 'tu taxista'}* (*${drv?.plate || ''}*)?\n\nResponde con un número del *1* al *5*:\n⭐⭐⭐⭐⭐ *5* - Excelente\n⭐⭐⭐⭐ *4* - Muy bueno\n⭐⭐⭐ *3* - Regular\n⭐⭐ *2* - Malo\n⭐ *1* - Muy malo\n\n_(O escribe *OMITIR* para saltar)_`
-        );
+      if (session.role === 'DRIVER' && normalizedCmd === 'FIN') {
+        await completeTripAndPromptRatings(session.tripId, 'DRIVER');
         return;
       }
 
-      // Título explícito: 👤 USUARIO vs 🚕 TAXISTA
       const roleTitle =
         session.role === 'PASSENGER'
           ? `👤 *USUARIO${session.senderName ? ` (${session.senderName})` : ''}:*`
@@ -1472,75 +1705,199 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
             `${location.degreesLatitude},${location.degreesLongitude}`,
           ]
         );
+
+        // Verificar si esta ubicación está a <= 250m del destino B (pasados al menos 2 min del inicio)
+        const destCheck = await db.query(
+          `SELECT id,
+                  ST_Y(dropoff_location::geometry) AS drop_lat,
+                  ST_X(dropoff_location::geometry) AS drop_lng
+           FROM trips
+           WHERE id = $1
+             AND status = 'ACTIVE'
+             AND dropoff_location IS NOT NULL
+             AND accepted_at <= NOW() - INTERVAL '2 minutes'`,
+          [session.tripId]
+        );
+        if (destCheck.rows.length > 0) {
+          const dRow = destCheck.rows[0];
+          const distToDrop = haversineMeters(
+            location.degreesLatitude,
+            location.degreesLongitude,
+            Number(dRow.drop_lat),
+            Number(dRow.drop_lng)
+          );
+          if (distToDrop <= 250) {
+            await sendTripProgressCheckIn(
+              session.tripId,
+              'Detectamos que ya llegaron cerca del punto de destino.'
+            );
+          }
+        }
       }
       return;
     }
 
-    // 1E. CAPTURA DE CALIFICACIÓN PENDIENTE DEL PASAJERO (1 A 5)
+    // 1E. CAPTURA BILATERAL DE CALIFICACIÓN (1 A 5) Y COMENTARIO OPCIONAL
     const rateRaw = await redis.get(`rate:${from}`);
     if (rateRaw) {
-      if (location) {
-        await redis.del(`rate:${from}`);
-      } else if (upperText === 'OMITIR') {
-        await redis.del(`rate:${from}`);
-        await sendText(
-          from,
-          '🚖 *CENTRAL TAXI CALDAS:*\n👌 Calificación omitida. Cuando necesites otro taxi, envíanos tu ubicación o escribe *COTIZAR*.'
-        );
-        return;
-      } else {
-        const match = text.match(/^([1-5])(\s|$|\*|⭐)/);
-        if (match) {
-          const score = Number(match[1]);
-          const rateState = JSON.parse(rateRaw);
+      const rateState = JSON.parse(rateRaw);
 
-          await db.query(`UPDATE trips SET rating = $1 WHERE id = $2`, [
-            score,
-            rateState.tripId,
-          ]);
-          const drvUpdate = await db.query(
-            `UPDATE drivers
-             SET rating_avg = ROUND(((COALESCE(rating_avg, 5.0) * COALESCE(rating_count, 0)) + $1)::numeric / (COALESCE(rating_count, 0) + 1), 2),
-                 rating_count = COALESCE(rating_count, 0) + 1
-             WHERE id = $2
-             RETURNING phone, rating_avg, rating_count`,
-            [score, rateState.driverId]
-          );
-
+      // Si envía ubicación o un comando operativo nuevo, liberamos la encuesta para no bloquearlo
+      if (
+        location ||
+        /^(HOLA|TAXI|NECESITO|SERVICIO|PIDO|COTIZAR|ACTIVO|SALDO|PAUSA|PEDIR TAXI|MODO CONDUCTOR)$/i.test(
+          normalizedCmd
+        )
+      ) {
+        await redis.del(`rate:${from}`);
+      } else if (rateState.step === 'COMMENT') {
+        if (
+          ['LISTO', 'OMITIR', 'NO', 'OK', 'GRACIAS', 'NINGUNO'].includes(
+            normalizedCmd
+          )
+        ) {
           await redis.del(`rate:${from}`);
           await sendText(
             from,
-            `🚖 *CENTRAL TAXI CALDAS:*\n🙏 *¡Gracias por tu calificación de ${score}/5!*\nTu opinión nos ayuda a mantener el mejor servicio.`
+            '🚖 *CENTRAL TAXI CALDAS:*\n✅ ¡Gracias por tu opinión! Estamos a tu servicio.'
           );
+          return;
+        }
 
-          const updatedDrv = drvUpdate.rows[0];
-          if (updatedDrv) {
-            await sendText(
-              updatedDrv.phone,
-              `🚖 *CENTRAL TAXI CALDAS:*\n⭐ *¡Recibiste una calificación de ${score}/5!*\nTu promedio actual es *${updatedDrv.rating_avg} ⭐* (${updatedDrv.rating_count} viajes calificados).`
+        if (text) {
+          const cleanComment = text.slice(0, 300);
+          if (rateState.targetRole === 'DRIVER') {
+            await db.query(
+              `UPDATE trips SET passenger_comment = $1 WHERE id = $2`,
+              [cleanComment, rateState.tripId]
+            );
+          } else {
+            await db.query(
+              `UPDATE trips SET driver_comment = $1 WHERE id = $2`,
+              [cleanComment, rateState.tripId]
             );
           }
 
-          if (score <= 2) {
-            for (const adminPhone of adminPhones) {
+          await redis.del(`rate:${from}`);
+          await sendText(
+            from,
+            '🚖 *CENTRAL TAXI CALDAS:*\n💬 *¡Comentario guardado!* Muchas gracias por ayudarnos a mejorar.'
+          );
+
+          if (rateState.targetPhone) {
+            await sendText(
+              rateState.targetPhone,
+              `🚖 *CENTRAL TAXI CALDAS:*\n💬 *Comentario recibido de tu último viaje:* "${cleanComment}"`
+            );
+          }
+          return;
+        }
+      } else {
+        // step === 'RATING'
+        if (normalizedCmd === 'OMITIR') {
+          await redis.del(`rate:${from}`);
+          await sendText(
+            from,
+            '🚖 *CENTRAL TAXI CALDAS:*\n👌 Calificación omitida. Cuando necesites otro servicio, escríbenos.'
+          );
+          return;
+        }
+
+        const match = text.match(/^([1-5])(?:[\s*⭐.,:-]+(.*))?$/);
+        if (match) {
+          const score = Number(match[1]);
+          const inlineComment = (match[2] || '').trim().slice(0, 300);
+
+          if (rateState.targetRole === 'DRIVER') {
+            await db.query(
+              `UPDATE trips
+               SET rating = $1,
+                   passenger_comment = COALESCE(NULLIF($2, ''), passenger_comment)
+               WHERE id = $3`,
+              [score, inlineComment, rateState.tripId]
+            );
+            const drvUpdate = await db.query(
+              `UPDATE drivers
+               SET rating_avg = ROUND(((COALESCE(rating_avg, 5.0) * COALESCE(rating_count, 0)) + $1)::numeric / (COALESCE(rating_count, 0) + 1), 2),
+                   rating_count = COALESCE(rating_count, 0) + 1
+               WHERE id = $2
+               RETURNING phone, rating_avg, rating_count`,
+              [score, rateState.targetId]
+            );
+
+            const updatedDrv = drvUpdate.rows[0];
+            if (updatedDrv) {
               await sendText(
-                adminPhone,
-                `🚖 *CENTRAL TAXI CALDAS • CALIFICACIÓN BAJA (${score}/5)*\n\n🚕 Taxista: *${rateState.driverName}* (*${rateState.plate}*)\n🧾 Viaje ID: *#${rateState.tripId}*\n👤 Usuario: *${from}*`
+                updatedDrv.phone,
+                `🚖 *CENTRAL TAXI CALDAS:*\n⭐ *¡Recibiste una calificación de ${score}/5!*\n` +
+                  (inlineComment ? `💬 Comentario: "${inlineComment}"\n` : '') +
+                  `Tu promedio actual es *${updatedDrv.rating_avg} ⭐* (${updatedDrv.rating_count} viajes calificados).`
               );
             }
+
+            if (score <= 2) {
+              for (const adminPhone of adminPhones) {
+                await sendText(
+                  adminPhone,
+                  `🚖 *CENTRAL TAXI CALDAS • CALIFICACIÓN BAJA A TAXISTA (${score}/5)*\n\n` +
+                    `🚕 Taxista: *${rateState.targetName}* (*${rateState.plate}*)\n` +
+                    `🧾 Viaje ID: *#${rateState.tripId}*\n` +
+                    `👤 Usuario: *${from}*` +
+                    (inlineComment ? `\n💬 Comentario: "${inlineComment}"` : '')
+                );
+              }
+            }
+          } else {
+            // Taxista calificando al Usuario
+            await db.query(
+              `UPDATE trips
+               SET driver_rating = $1,
+                   driver_comment = COALESCE(NULLIF($2, ''), driver_comment)
+               WHERE id = $3`,
+              [score, inlineComment, rateState.tripId]
+            );
+            const passUpdate = await db.query(
+              `UPDATE passengers
+               SET rating_avg = ROUND(((COALESCE(rating_avg, 5.0) * COALESCE(rating_count, 0)) + $1)::numeric / (COALESCE(rating_count, 0) + 1), 2),
+                   rating_count = COALESCE(rating_count, 0) + 1
+               WHERE phone = $2
+               RETURNING phone, rating_avg, rating_count`,
+              [score, rateState.targetPhone]
+            );
+
+            const updatedPass = passUpdate.rows[0];
+            if (updatedPass) {
+              await sendText(
+                updatedPass.phone,
+                `🚖 *CENTRAL TAXI CALDAS:*\n⭐ *El taxista calificó tu viaje con ${score}/5.*\n` +
+                  (inlineComment ? `💬 Comentario: "${inlineComment}"\n` : '') +
+                  `Tu calificación como usuario es *${updatedPass.rating_avg} ⭐*.`
+              );
+            }
+          }
+
+          if (inlineComment) {
+            await redis.del(`rate:${from}`);
+            await sendText(
+              from,
+              `🚖 *CENTRAL TAXI CALDAS:*\n🙏 *¡Gracias por tu calificación de ${score}/5 y tu comentario!*\nTu opinión nos ayuda a mantener el mejor servicio.`
+            );
+          } else {
+            rateState.step = 'COMMENT';
+            await redis.set(`rate:${from}`, JSON.stringify(rateState), 'EX', 300);
+            await sendText(
+              from,
+              `🚖 *CENTRAL TAXI CALDAS:*\n⭐ *¡Calificación de ${score}/5 guardada!*\n\n💬 Si deseas dejar un *comentario adicional* sobre el viaje, escríbelo ahora.\n_(O escribe *LISTO* para finalizar)_`
+            );
           }
           return;
         }
 
-        if (/HOLA|TAXI|NECESITO|SERVICIO|PIDO|COTIZAR/i.test(upperText)) {
-          await redis.del(`rate:${from}`);
-        } else {
-          await sendText(
-            from,
-            '🚖 *CENTRAL TAXI CALDAS:*\n⭐ Por favor responde con un número del *1* al *5* para calificar tu último viaje, o escribe *OMITIR*.'
-          );
-          return;
-        }
+        await sendText(
+          from,
+          '🚖 *CENTRAL TAXI CALDAS:*\n⭐ Por favor responde con un número del *1* al *5* (ej: *5* o *5 Muy buen servicio*), o escribe *OMITIR*.'
+        );
+        return;
       }
     }
 
@@ -1561,7 +1918,11 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         isDriverInPassengerMode &&
         (cmd === 'MODO CONDUCTOR' || cmd === 'VOLVER A CONDUCTOR')
       ) {
-        await redis.del(`driver_passenger_mode:${from}`, `quote:${from}`, `pending_pickup:${from}`);
+        await redis.del(
+          `driver_passenger_mode:${from}`,
+          `quote:${from}`,
+          `pending_pickup:${from}`
+        );
         await sendText(
           from,
           `🚖 *CENTRAL TAXI CALDAS:*\n🚕 *Modo Taxista activado nuevamente, ${driver.full_name}.*\nEnvía tu *ubicación* (📎 -> Ubicación) o escribe *ACTIVO* para recibir servicios.`
@@ -1765,10 +2126,11 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           }
 
           const [passRes, drvPassRes, completedRes] = await Promise.all([
-            db.query(`SELECT full_name FROM passengers WHERE phone = $1`, [
-              trip.passenger_phone,
-            ]),
-            db.query(`SELECT full_name FROM drivers WHERE phone = $1`, [
+            db.query(
+              `SELECT full_name, rating_avg FROM passengers WHERE phone = $1`,
+              [trip.passenger_phone]
+            ),
+            db.query(`SELECT full_name, rating_avg FROM drivers WHERE phone = $1`, [
               trip.passenger_phone,
             ]),
             db.query(
@@ -1779,8 +2141,18 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
           const passengerName =
             passRes.rows[0]?.full_name || drvPassRes.rows[0]?.full_name || null;
+          const passengerRating =
+            passRes.rows[0]?.rating_avg || drvPassRes.rows[0]?.rating_avg || '5.00';
           const completedTrips = completedRes.rows[0]?.total || 0;
           const eta = calculateEtaEstimate(distanceMeters);
+
+          // Ajustar duración esperada incluyendo tiempo de llegada al punto A
+          const totalExpectedMins =
+            eta.minMins + Number(trip.duration_minutes || 12);
+          await db.query(
+            `UPDATE trips SET duration_minutes = $1 WHERE id = $2`,
+            [totalExpectedMins, trip.id]
+          );
 
           await redis.del(`offer:${from}`);
           await redis.set(
@@ -1859,7 +2231,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           await sendText(
             from,
             `🚖 *CENTRAL TAXI CALDAS • SERVICIO ASIGNADO*\n\n` +
-              `👤 *Usuario:* ${passengerName || 'Cliente Taxi Caldas'}\n` +
+              `👤 *Usuario:* ${passengerName || 'Cliente Taxi Caldas'} (${passengerRating} ⭐)\n` +
               `⏱️ *Tiempo estimado al punto A:* ${eta.rangeText}` +
               `${quoteInfoForDriver}\n` +
               `💸 *Comisión descontada:* -${formatCOP(tripCommission)}\n` +
@@ -2163,7 +2535,12 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
       if (upperText === 'ELIMINAR MIS DATOS' || upperText === 'REVOCAR DATOS') {
         await db.query(`DELETE FROM passengers WHERE phone = $1`, [from]);
-        await redis.del(`consent_pending:${from}`, `ask_name:${from}`, `quote:${from}`, `pending_pickup:${from}`);
+        await redis.del(
+          `consent_pending:${from}`,
+          `ask_name:${from}`,
+          `quote:${from}`,
+          `pending_pickup:${from}`
+        );
         await sendText(
           from,
           '🚖 *CENTRAL TAXI CALDAS:*\n🗑️ Tus datos personales han sido eliminados de nuestra base de datos conforme a la Ley 1581 de 2012. Si deseas volver a usar el servicio más adelante, escríbenos *HOLA*.'
@@ -2346,7 +2723,6 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
     const quoteRaw = await redis.get(`quote:${from}`);
     const pendingPickupRaw = await redis.get(`pending_pickup:${from}`);
 
-    // Si el usuario inicia manualmente COTIZAR
     if (isQuoteIntent(upperText)) {
       await redis.del(`ask_name:${from}`, `pending_pickup:${from}`);
       await redis.set(
@@ -2366,7 +2742,6 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       return;
     }
 
-    // Si está dentro del flujo guiado de cotización (ASK_ORIGIN -> ASK_DESTINATION -> CONFIRM_QUOTE)
     if (quoteRaw) {
       const qState = JSON.parse(quoteRaw);
 
@@ -2466,6 +2841,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
             pickup: qState.origin,
             dropoff: qState.destination,
             distanceKm: qState.distanceKm,
+            durationMinutes: qState.durationMinutes,
             estimatedFare: qState.estimatedFare,
             tripCommission,
           });
@@ -2480,9 +2856,6 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       }
     }
 
-    // Si el usuario había enviado Punto A (GPS) y ahora responde:
-    // - "1" / "DIRECTO" / "PEDIR" -> despacha sin destino B
-    // - Otro texto o segundo GPS -> lo toma como Punto B, cotiza y pide confirmación
     if (pendingPickupRaw) {
       const pState = JSON.parse(pendingPickupRaw);
       const pickupPoint: GeoPoint = pState.origin;
@@ -2556,7 +2929,6 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       return;
     }
 
-    // Si envía ubicación GPS directamente (Punto A): ofrece cotizar Punto B o pedir directo (con auto-despacho a los 18s)
     if (location) {
       await redis.del(`ask_name:${from}`);
       const pickupPoint: GeoPoint = {
@@ -2582,7 +2954,6 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           `• O responde *1* / *DIRECTO* para buscar tu taxi de inmediato.`
       );
 
-      // Si el usuario no escribe destino en 18 segundos, despacha automáticamente para no demorarlo
       setTimeout(async () => {
         try {
           const stillWaitingRaw = await redis.get(`pending_pickup:${from}`);
@@ -2641,7 +3012,6 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       return;
     }
 
-    // Usuario ya registrado escribiendo por segunda vez o más: lo saludamos por su nombre
     await sendText(
       from,
       `🚖 *CENTRAL TAXI CALDAS:*\n👋 ¡Hola *${passengerName}*! Qué gusto saludarte de nuevo.\n\n` +
