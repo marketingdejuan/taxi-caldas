@@ -23,7 +23,17 @@ fs.mkdirSync(uploadsDir, { recursive: true });
 app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
 const db = new Pool({ connectionString: process.env.DATABASE_URL });
-const redis = new Redis(process.env.REDIS_URL!);
+const redis = new Redis(process.env.REDIS_URL || 'redis://redis:6379/0', {
+  maxRetriesPerRequest: null,
+  retryStrategy(times) {
+    return Math.min(times * 500, 5000);
+  },
+});
+
+db.on('error', (err) => console.error('⚠️ Error en pool PostgreSQL:', err.message));
+redis.on('error', (err) => console.error('⚠️ Error en conexión Redis:', err.message));
+process.on('uncaughtException', (err) => console.error('⚠️ Excepción no capturada:', err));
+process.on('unhandledRejection', (err) => console.error('⚠️ Promesa rechazada:', err));
 
 const INITIAL_RADIUS_METERS = 2500;
 const EXPANDED_RADIUS_METERS = 5000;
@@ -1395,7 +1405,8 @@ async function registerWebhookOnBoot() {
 
 ensureDatabaseSchema(db).catch((e) => console.error('❌ Error DB init:', e));
 
-app.listen(process.env.PORT, () => {
+const PORT = Number(process.env.PORT) || 4000;
+app.listen(PORT, "0.0.0.0", () => {
   console.log(
     `🚀 Central de Taxis corriendo en http://localhost:${process.env.PORT}`
   );
