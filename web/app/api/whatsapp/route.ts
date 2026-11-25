@@ -7,7 +7,7 @@ const API_KEY = process.env.EVOLUTION_API_KEY || '';
 const INSTANCE = process.env.INSTANCE_NAME || 'central_taxi';
 const WEBHOOK_URL =
   process.env.BACKEND_WEBHOOK_URL ||
-  'http://host.docker.internal:4000/webhook/whatsapp';
+  'http://backend:4000/webhook/whatsapp';
 
 async function evoFetch(endpoint: string, options: RequestInit = {}) {
   const res = await fetch(`${EVOLUTION_URL}${endpoint}`, {
@@ -43,12 +43,24 @@ async function ensureWebhook() {
 }
 
 async function getSettingsMap(): Promise<Record<string, string>> {
-  const res = await db.query(`SELECT key, value FROM app_settings`);
-  const map: Record<string, string> = {};
-  for (const row of res.rows) {
-    map[row.key] = row.value;
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key VARCHAR(50) PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      )
+    `);
+    const res = await db.query(`SELECT key, value FROM app_settings`);
+    const map: Record<string, string> = {};
+    for (const row of res.rows) {
+      map[row.key] = row.value;
+    }
+    return map;
+  } catch (err) {
+    console.error('Aviso leyendo app_settings:', err);
+    return {};
   }
-  return map;
 }
 
 export async function GET() {
@@ -60,54 +72,75 @@ export async function GET() {
   try {
     const [stateRes, instancesRes, settings] = await Promise.all([
       evoFetch(`/instance/connectionState/${INSTANCE}`),
-      evoFetch(`/instance/fetchInstances?instanceName=${INSTANCE}`),
+      evoFetch(`/instance/fetchInstances`),
       getSettingsMap(),
     ]);
-
-    const state =
-      stateRes.data?.instance?.state ||
-      stateRes.data?.state ||
-      'close';
 
     let instanceInfo: any = null;
     if (Array.isArray(instancesRes.data)) {
       instanceInfo =
         instancesRes.data.find(
           (i: any) => i.name === INSTANCE || i.instanceName === INSTANCE
-        ) || instancesRes.data[0];
-    } else if (instancesRes.data) {
-      instanceInfo = instancesRes.data;
+        ) || null;
+    } else if (instancesRes.data?.instance) {
+      instanceInfo = instancesRes.data.instance;
+    }
+
+    const stateFromEndpoint =
+      stateRes.data?.instance?.state || stateRes.data?.state || '';
+    const stateFromList =
+      instanceInfo?.connectionStatus || instanceInfo?.status || '';
+
+    let state = 'close';
+    if (stateFromEndpoint === 'open' || stateFromList === 'open') {
+      state = 'open';
+    } else if (
+      stateFromEndpoint === 'connecting' ||
+      stateFromList === 'connecting'
+    ) {
+      state = 'connecting';
     }
 
     const ownerJid: string =
-      instanceInfo?.ownerJid || instanceInfo?.instance?.owner || '';
-    const connectedPhone = ownerJid ? ownerJid.split('@')[0] : null;
+      instanceInfo?.ownerJid ||
+      instanceInfo?.owner ||
+      stateRes.data?.instance?.owner ||
+      '';
+    const connectedPhone = ownerJid
+      ? ownerJid.split('@')[0].split(':')[0]
+      : null;
     const profileName =
-      instanceInfo?.profileName || instanceInfo?.instance?.profileName || null;
+      instanceInfo?.profileName ||
+      instanceInfo?.instance?.profileName ||
+      null;
 
-    if (state === 'open' && connectedPhone && settings.central_phone !== connectedPhone) {
-      await db.query(
-        `INSERT INTO app_settings (key, value, updated_at)
-         VALUES ('central_phone', $1, NOW())
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
-        [connectedPhone]
-      );
-      settings.central_phone = connectedPhone;
+    if (state === 'open') {
+      await ensureWebhook();
 
-      const currentAdmins = (settings.admin_phones || '')
-        .split(',')
-        .map((p) => p.trim())
-        .filter(Boolean);
-
-      if (!currentAdmins.includes(connectedPhone)) {
-        const updatedAdmins = [...currentAdmins, connectedPhone].join(',');
+      if (connectedPhone && settings.central_phone !== connectedPhone) {
         await db.query(
           `INSERT INTO app_settings (key, value, updated_at)
-           VALUES ('admin_phones', $1, NOW())
+           VALUES ('central_phone', $1, NOW())
            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
-          [updatedAdmins]
+          [connectedPhone]
         );
-        settings.admin_phones = updatedAdmins;
+        settings.central_phone = connectedPhone;
+
+        const currentAdmins = (settings.admin_phones || '')
+          .split(',')
+          .map((p) => p.trim())
+          .filter(Boolean);
+
+        if (!currentAdmins.includes(connectedPhone)) {
+          const updatedAdmins = [...currentAdmins, connectedPhone].join(',');
+          await db.query(
+            `INSERT INTO app_settings (key, value, updated_at)
+             VALUES ('admin_phones', $1, NOW())
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+            [updatedAdmins]
+          );
+          settings.admin_phones = updatedAdmins;
+        }
       }
     }
 
@@ -169,7 +202,13 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true });
     }
 
-    // DESLIGAR / DESVINCULAR TELÉFONO COMPLETAMENTE
+    if (action === 'RESTART') {
+      await evoFetch(`/instance/restart/${INSTANCE}`, { method: 'POST' });
+      await evoFetch(`/instance/restart/${INSTANCE}`, { method: 'PUT' });
+      await ensureWebhook();
+      return NextResponse.json({ ok: true });
+    }
+
     if (action === 'UNLINK') {
       await evoFetch(`/instance/logout/${INSTANCE}`, { method: 'DELETE' });
       await evoFetch(`/instance/delete/${INSTANCE}`, { method: 'DELETE' });
@@ -181,7 +220,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, unlinked: true });
     }
 
-    // GENERAR QR LIMPIO PARA VINCULAR UN NÚMERO NUEVO
     if (action === 'SWITCH_NUMBER' || action === 'GET_QR') {
       await evoFetch(`/instance/logout/${INSTANCE}`, { method: 'DELETE' });
       await evoFetch(`/instance/delete/${INSTANCE}`, { method: 'DELETE' });

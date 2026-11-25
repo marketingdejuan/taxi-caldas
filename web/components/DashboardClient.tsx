@@ -245,7 +245,7 @@ export default function DashboardClient() {
   }
 
   async function handleWhatsAppAction(
-    action: 'UNLINK' | 'SWITCH_NUMBER' | 'GET_QR'
+    action: 'UNLINK' | 'SWITCH_NUMBER' | 'GET_QR' | 'RESTART'
   ) {
     setWaLoading(true);
     setWaFeedback('');
@@ -990,7 +990,7 @@ export default function DashboardClient() {
                       : 'bg-red-100 text-red-800'
                   }`}
                 >
-                  {isConnected ? '🟢 Conectado' : '🔴 Desligado'}
+                  {isConnected ? '🟢 Conectado' : waStatus?.state === 'connecting' ? '🟡 Sincronizando...' : '🔴 Desligado'}
                 </span>
               </div>
 
@@ -1015,6 +1015,15 @@ export default function DashboardClient() {
               )}
 
               <div className="flex flex-wrap gap-3">
+                <button
+                  disabled={waLoading}
+                  onClick={() => handleWhatsAppAction('RESTART')}
+                  className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                >
+                  <RefreshCw className={`h-4 w-4 ${waLoading ? 'animate-spin' : ''}`} />
+                  Sincronizar sesión
+                </button>
+
                 {isConnected && (
                   <button
                     disabled={waLoading}
