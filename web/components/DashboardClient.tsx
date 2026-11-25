@@ -342,7 +342,7 @@ export default function DashboardClient() {
       <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/95 backdrop-blur px-4 sm:px-6 py-3 shadow-sm">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-2">
           <div className="flex items-center gap-3">
-            <TaxiCaldasLogo size="sm" darkText={true} />
+            <TaxiCaldasLogo size="sm" theme="light" />
             <button
               onClick={() => setTab('WHATSAPP')}
               className="hidden sm:inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs hover:bg-slate-100"
