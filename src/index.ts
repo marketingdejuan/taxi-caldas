@@ -53,6 +53,24 @@ function formatProperName(raw: string): string {
     .join(' ');
 }
 
+function isConsentAccepted(upperText: string): boolean {
+  const accepted = [
+    'ACEPTO',
+    'ACEPTAR',
+    'SI',
+    'SÍ',
+    'AUTORIZO',
+    'DE ACUERDO',
+    'OK',
+    '1',
+  ];
+  return accepted.includes(upperText.trim());
+}
+
+function isConsentRejected(upperText: string): boolean {
+  return ['NO', 'NO ACEPTO', 'RECHAZO'].includes(upperText.trim());
+}
+
 function isInvalidNameInput(text: string): boolean {
   const clean = text.trim();
   if (clean.length < 2 || clean.length > 45) return true;
@@ -76,21 +94,32 @@ function isInvalidNameInput(text: string): boolean {
     'OK',
     'SI',
     'NO',
+    'ACEPTO',
   ];
   return blockedWords.includes(clean.toUpperCase());
 }
 
-async function upsertPassenger(phone: string, pushName?: string | null) {
-  const res = await db.query(
-    `INSERT INTO passengers (phone, push_name, last_interaction_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (phone) DO UPDATE SET
-       push_name = COALESCE(NULLIF(EXCLUDED.push_name, ''), passengers.push_name),
-       last_interaction_at = NOW()
-     RETURNING *`,
-    [phone, pushName || null]
-  );
-  return res.rows[0];
+function calculateEtaEstimate(distanceMeters: number | null | undefined): {
+  rangeText: string;
+  distanceText: string;
+} {
+  if (distanceMeters == null || isNaN(Number(distanceMeters)) || Number(distanceMeters) <= 0) {
+    return {
+      rangeText: '5 a 8 minutos',
+      distanceText: 'Cerca de tu ubicación',
+    };
+  }
+  const dist = Math.round(Number(distanceMeters));
+  // Velocidad urbana promedio (~420 m/min) + margen de tráfico
+  const minMins = Math.max(2, Math.round(dist / 420));
+  const maxMins = minMins + 3;
+  const distanceText =
+    dist >= 1000 ? `${(dist / 1000).toFixed(1)} km` : `${dist} metros`;
+
+  return {
+    rangeText: `${minMins} a ${maxMins} minutos`,
+    distanceText,
+  };
 }
 
 async function getRuntimeConfig() {
@@ -879,6 +908,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         const client = await db.connect();
         let newBalance = 0;
         let trip: any = null;
+        let distanceMeters: number | null = null;
 
         try {
           await client.query('BEGIN');
@@ -919,10 +949,17 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
             `UPDATE trips
              SET driver_id = $1, status = 'ACTIVE', accepted_at = NOW()
              WHERE id = $2
-             RETURNING *, ST_Y(pickup_location::geometry) AS lat, ST_X(pickup_location::geometry) AS lng`,
+             RETURNING *,
+               ST_Y(pickup_location::geometry) AS lat,
+               ST_X(pickup_location::geometry) AS lng,
+               (
+                 SELECT ROUND(ST_Distance(d.location, trips.pickup_location))
+                 FROM drivers d WHERE d.id = $1
+               ) AS distance_meters`,
             [driver.id, pendingTripId]
           );
           trip = tripRes.rows[0];
+          distanceMeters = trip.distance_meters;
 
           await client.query(
             `INSERT INTO wallet_transactions (driver_id, amount, type, trip_id, description)
@@ -939,11 +976,19 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           client.release();
         }
 
-        const passRes = await db.query(
-          `SELECT full_name FROM passengers WHERE phone = $1`,
-          [trip.passenger_phone]
-        );
+        const [passRes, completedRes] = await Promise.all([
+          db.query(`SELECT full_name FROM passengers WHERE phone = $1`, [
+            trip.passenger_phone,
+          ]),
+          db.query(
+            `SELECT COUNT(*)::int AS total FROM trips WHERE driver_id = $1 AND status = 'COMPLETED'`,
+            [driver.id]
+          ),
+        ]);
+
         const passengerName = passRes.rows[0]?.full_name || null;
+        const completedTrips = completedRes.rows[0]?.total || 0;
+        const eta = calculateEtaEstimate(distanceMeters);
 
         await redis.del(`offer:${from}`);
         await redis.set(
@@ -963,14 +1008,47 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           7200
         );
 
-        await sendText(
-          trip.passenger_phone,
-          `✅ *¡Taxi asignado${passengerName ? `, ${passengerName}` : ''}!*\n\n🚕 Vehículo: *${driver.vehicle_model}*\n🔢 Placa: *${driver.plate}*\n👤 Conductor: *${driver.full_name}* (${driver.rating_avg || '5.00'} ⭐)\n\nPuedes enviar mensajes, fotos, videos o notas de voz por este chat (tu número permanece privado).\n• Escribe *CANCELAR* para cancelar\n• Escribe *SOS* en caso de emergencia`
-        );
+        const passengerCardText =
+          `✅ *¡Taxi asignado${passengerName ? `, ${passengerName}` : ''}!*\n\n` +
+          `⏱️ *Tiempo estimado de llegada:* *${eta.rangeText}* (${eta.distanceText})\n\n` +
+          `👨‍✈️ *Perfil del Conductor:*\n` +
+          `• *Nombre:* ${driver.full_name}\n` +
+          `• *Calificación:* ${driver.rating_avg || '5.00'} ⭐ (${driver.rating_count || 0} calif.)\n` +
+          `• *Servicios completados:* ${completedTrips}\n` +
+          `• *Estado:* Verificado ✅\n\n` +
+          `🚕 *Datos del Vehículo:*\n` +
+          `• *Vehículo:* ${driver.vehicle_model}\n` +
+          `• *Placa:* *${driver.plate}*\n\n` +
+          `🔒 Tu número permanece privado. Puedes enviar mensajes, fotos o notas de voz por este chat.\n` +
+          `• Escribe *CANCELAR* para cancelar\n` +
+          `• Escribe *SOS* en caso de emergencia`;
+
+        let photoSent = false;
+        if (driver.profile_photo_path) {
+          const fullPhotoPath = path.join(
+            process.cwd(),
+            driver.profile_photo_path
+          );
+          if (fs.existsSync(fullPhotoPath)) {
+            const photoBase64 = fs.readFileSync(fullPhotoPath).toString('base64');
+            await sendMedia(
+              trip.passenger_phone,
+              'image',
+              photoBase64,
+              'image/jpeg',
+              passengerCardText
+            );
+            photoSent = true;
+          }
+        }
+
+        if (!photoSent) {
+          await sendText(trip.passenger_phone, passengerCardText);
+        }
 
         await sendText(
           from,
-          `✅ *¡Servicio asignado a ti!*\n👤 Pasajero: *${passengerName || 'Cliente Taxi Caldas'}*\n💸 Comisión descontada: *-${formatCOP(tripCommission)}*\n💰 Saldo restante: *${formatCOP(newBalance)}*\n\nEscribe o envía audios/fotos por aquí para hablar con el pasajero.\n• *FIN* - Terminar viaje\n• *CANCELAR* - Cancelar servicio\n• *SOS* - Emergencia`
+          `✅ *¡Servicio asignado a ti!*\n👤 Pasajero: *${passengerName || 'Cliente Taxi Caldas'}*\n⏱️ Tiempo estimado al punto: *${eta.rangeText}*\n💸 Comisión descontada: *-${formatCOP(tripCommission)}*\n💰 Saldo restante: *${formatCOP(newBalance)}*\n\nEscribe o envía audios/fotos por aquí para hablar con el pasajero.\n• *FIN* - Terminar viaje\n• *CANCELAR* - Cancelar servicio\n• *SOS* - Emergencia`
         );
         await sendLocation(from, trip.lat, trip.lng, 'Punto de recogida');
         return;
@@ -983,14 +1061,14 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       return;
     }
 
-    // 3. FLUJO DE AUTO-REGISTRO DE NUEVO TAXISTA
+    // 3. FLUJO DE AUTO-REGISTRO DE NUEVO TAXISTA CON HABEAS DATA Y FOTO DE PERFIL
     const regRaw = await redis.get(`reg:${from}`);
 
     if (upperText === 'CANCELAR' && regRaw) {
       await redis.del(`reg:${from}`);
       await sendText(
         from,
-        '❌ Registro cancelado. Si deseas pedir un taxi, envía tu ubicación.'
+        '❌ Registro cancelado. Si deseas pedir un taxi, escríbenos *HOLA*.'
       );
       return;
     }
@@ -1001,22 +1079,53 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         upperText === 'REGISTRO' ||
         upperText === 'REGISTRARME')
     ) {
-      await redis.del(`ask_name:${from}`);
+      await redis.del(`consent_pending:${from}`, `ask_name:${from}`);
       await redis.set(
         `reg:${from}`,
-        JSON.stringify({ step: 'ASK_NAME' }),
+        JSON.stringify({ step: 'ASK_CONSENT' }),
         'EX',
         1800
       );
       await sendText(
         from,
-        '🚕 *Registro de Conductor - Taxi Caldas*\n\nVamos a guardar tu perfil en nuestra base de datos en 4 pasos rápidos (escribe *CANCELAR* en cualquier momento para salir).\n\n1️⃣ Por favor escribe tu *nombre y apellido*:'
+        '🚕 *Afiliación de Conductores - Taxi Caldas*\n\n' +
+          '📋 *Autorización de Tratamiento de Datos (Ley 1581 de 2012):*\n' +
+          'Para validar tu identidad, vehículo, documentos, foto de perfil y ubicación GPS durante los servicios, autorizas a *Taxi Caldas* el tratamiento de tus datos personales conforme a nuestra política de privacidad. Puedes conocer, actualizar o suprimir tus datos en cualquier momento.\n\n' +
+          '👉 Responde *ACEPTO* (o *1*) para iniciar tu registro, o *CANCELAR* para salir.'
       );
       return;
     }
 
     if (regRaw) {
       const regState = JSON.parse(regRaw);
+
+      if (regState.step === 'ASK_CONSENT') {
+        if (isConsentRejected(upperText)) {
+          await redis.del(`reg:${from}`);
+          await sendText(
+            from,
+            'ℹ️ Entendido. Sin autorización de tratamiento de datos no podemos registrar tu perfil de conductor en *Taxi Caldas*.'
+          );
+          return;
+        }
+        if (!isConsentAccepted(upperText)) {
+          await sendText(
+            from,
+            '📋 Por favor responde *ACEPTO* (o *1*) para autorizar el tratamiento de tus datos personales y continuar con tu registro, o escribe *CANCELAR*.'
+          );
+          return;
+        }
+
+        regState.dataConsent = true;
+        regState.dataConsentAt = new Date().toISOString();
+        regState.step = 'ASK_NAME';
+        await redis.set(`reg:${from}`, JSON.stringify(regState), 'EX', 1800);
+        await sendText(
+          from,
+          '✅ *Autorización registrada.*\n\nVamos a completar tu perfil en 5 pasos rápidos:\n1️⃣ Por favor escribe tu *nombre y apellido*:'
+        );
+        return;
+      }
 
       if (regState.step === 'ASK_NAME') {
         if (text.length < 3) {
@@ -1075,11 +1184,38 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           return;
         }
         regState.vehicleModel = text;
+        regState.step = 'ASK_PROFILE_PHOTO';
+        await redis.set(`reg:${from}`, JSON.stringify(regState), 'EX', 1800);
+        await sendText(
+          from,
+          '4️⃣ Ahora envía una *foto tipo selfie clara de tu rostro* (📎 -> Cámara o Galería).\n_Esta foto será mostrada a los pasajeros cuando aceptes un servicio para su seguridad._'
+        );
+        return;
+      }
+
+      if (regState.step === 'ASK_PROFILE_PHOTO') {
+        if (!imageMsg) {
+          await sendText(
+            from,
+            '🤳 Por favor adjunta una *foto de tu rostro* (imagen) para tu perfil de conductor, o escribe *CANCELAR*:'
+          );
+          return;
+        }
+
+        const media = await getMediaBase64(data);
+        const profileFileName = `profile_${from}_${Date.now()}.jpg`;
+        const profileRelativePath = `uploads/drivers/${profileFileName}`;
+        fs.writeFileSync(
+          path.join(process.cwd(), profileRelativePath),
+          Buffer.from(media.base64, 'base64')
+        );
+
+        regState.profilePhotoPath = profileRelativePath;
         regState.step = 'ASK_DOC_PHOTO';
         await redis.set(`reg:${from}`, JSON.stringify(regState), 'EX', 1800);
         await sendText(
           from,
-          '4️⃣ Por último, envía una *foto clara de tu Tarjetón / Licencia de conducción o Tarjeta de Propiedad* (📎 -> Cámara o Galería):'
+          '5️⃣ ¡Foto de perfil guardada! Por último, envía una *foto clara de tu Tarjetón / Licencia de conducción o Tarjeta de Propiedad* (📎 -> Cámara o Galería):'
         );
         return;
       }
@@ -1095,22 +1231,28 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
         const media = await getMediaBase64(data);
         const ext = docMsg ? 'pdf' : 'jpg';
-        const fileName = `${from}_${Date.now()}.${ext}`;
-        const relativePath = `uploads/drivers/${fileName}`;
+        const docFileName = `doc_${from}_${Date.now()}.${ext}`;
+        const docRelativePath = `uploads/drivers/${docFileName}`;
         fs.writeFileSync(
-          path.join(process.cwd(), relativePath),
+          path.join(process.cwd(), docRelativePath),
           Buffer.from(media.base64, 'base64')
         );
 
         await db.query(
-          `INSERT INTO drivers (phone, full_name, plate, vehicle_model, status, is_verified, approval_status, balance, doc_photo_path)
-           VALUES ($1, $2, $3, $4, 'OFFLINE', FALSE, 'PENDING', 0, $5)`,
+          `INSERT INTO drivers (
+             phone, full_name, plate, vehicle_model, status, is_verified,
+             approval_status, balance, profile_photo_path, doc_photo_path,
+             data_consent, data_consent_at
+           )
+           VALUES ($1, $2, $3, $4, 'OFFLINE', FALSE, 'PENDING', 0, $5, $6, TRUE, $7)`,
           [
             from,
             regState.fullName,
             regState.plate,
             regState.vehicleModel,
-            relativePath,
+            regState.profilePhotoPath || null,
+            docRelativePath,
+            regState.dataConsentAt || new Date().toISOString(),
           ]
         );
 
@@ -1118,7 +1260,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
         await sendText(
           from,
-          `✅ *¡Solicitud de registro guardada, ${regState.fullName}!*\n\n🔢 Placa: *${regState.plate}*\n🚕 Vehículo: *${regState.vehicleModel}*\n\nValidaremos tus documentos y te activaremos por este mismo chat.`
+          `✅ *¡Solicitud de registro completada, ${regState.fullName}!*\n\n🔢 Placa: *${regState.plate}*\n🚕 Vehículo: *${regState.vehicleModel}*\n📋 Habeas Data: *Autorizado*\n\nValidaremos tu foto de perfil y documentos, y te activaremos por este mismo chat.`
         );
 
         const adminPhone = adminPhones[0];
@@ -1140,8 +1282,88 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       }
     }
 
-    // 4. REGISTRO AUTOMÁTICO DE CLIENTE / PASAJERO EN BASE DE DATOS
-    const passenger = await upsertPassenger(from, pushName);
+    // 4. VERIFICACIÓN PREVIA DE HABEAS DATA (LEY 1581 DE 2012) PARA CLIENTES / PASAJEROS
+    const passengerRes = await db.query(
+      `SELECT * FROM passengers WHERE phone = $1`,
+      [from]
+    );
+    let passenger = passengerRes.rows[0] || null;
+
+    if (upperText === 'ELIMINAR MIS DATOS' || upperText === 'REVOCAR DATOS') {
+      await db.query(`DELETE FROM passengers WHERE phone = $1`, [from]);
+      await redis.del(`consent_pending:${from}`, `ask_name:${from}`);
+      await sendText(
+        from,
+        '🗑️ Tus datos personales han sido eliminados de nuestra base de datos conforme a la Ley 1581 de 2012. Si deseas volver a usar *Taxi Caldas* más adelante, escríbenos *HOLA*.'
+      );
+      return;
+    }
+
+    if (!passenger || !passenger.data_consent) {
+      const pendingConsent = await redis.get(`consent_pending:${from}`);
+
+      if (pendingConsent) {
+        if (isConsentRejected(upperText)) {
+          await redis.del(`consent_pending:${from}`);
+          await sendText(
+            from,
+            'ℹ️ Entendido. Sin tu autorización de tratamiento de datos no podemos registrar tu perfil ni gestionar servicios en *Taxi Caldas*. Cuando desees autorizar, escríbenos *HOLA*.'
+          );
+          return;
+        }
+
+        if (isConsentAccepted(upperText)) {
+          const savedRes = await db.query(
+            `INSERT INTO passengers (phone, push_name, data_consent, data_consent_at, last_interaction_at)
+             VALUES ($1, $2, TRUE, NOW(), NOW())
+             ON CONFLICT (phone) DO UPDATE SET
+               push_name = COALESCE(NULLIF(EXCLUDED.push_name, ''), passengers.push_name),
+               data_consent = TRUE,
+               data_consent_at = NOW(),
+               last_interaction_at = NOW()
+             RETURNING *`,
+            [from, pushName || null]
+          );
+          passenger = savedRes.rows[0];
+          await redis.del(`consent_pending:${from}`);
+
+          if (!passenger.full_name) {
+            await redis.set(`ask_name:${from}`, '1', 'EX', 3600);
+            await sendText(
+              from,
+              '✅ *¡Autorización registrada!* Gracias por confiar en *Taxi Caldas*.\n\nPara brindarte una atención personalizada, ¿cuál es tu *nombre y apellido*? 😊'
+            );
+            return;
+          }
+        } else {
+          await sendText(
+            from,
+            '📋 Para continuar en *Taxi Caldas* y cumplir con la Ley 1581 de 2012 (Habeas Data), por favor responde *ACEPTO* (o *1*) autorizando el tratamiento de tus datos personales para gestionar tus servicios de taxi.'
+          );
+          return;
+        }
+      } else {
+        await redis.set(`consent_pending:${from}`, '1', 'EX', 3600);
+        await sendText(
+          from,
+          '👋 ¡Hola! Bienvenido a *Taxi Caldas*.\n\n' +
+            '📋 *Aviso de Protección de Datos (Ley 1581 de 2012):*\n' +
+            'Para gestionar tu solicitud de taxi, seguridad GPS e historial de viajes, autorizas a *Taxi Caldas* el tratamiento de tus datos personales conforme a nuestra política de privacidad. Podrás conocer, actualizar o suprimir tus datos en cualquier momento.\n\n' +
+            '👉 Responde *ACEPTO* (o *1*) para continuar.\n' +
+            '_(Si eres conductor y deseas afiliarte, escribe *SOY TAXISTA*)_'
+        );
+        return;
+      }
+    } else {
+      await db.query(
+        `UPDATE passengers
+         SET push_name = COALESCE(NULLIF($2, ''), push_name),
+             last_interaction_at = NOW()
+         WHERE phone = $1`,
+        [from, pushName || null]
+      );
+    }
+
     const passengerName: string | null = passenger?.full_name || null;
 
     if (upperText === 'CANCELAR') {
@@ -1227,7 +1449,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       return;
     }
 
-    // Si envía ubicación GPS: despachar de inmediato (sin frenar al cliente aunque aún no haya dado nombre)
+    // Si envía ubicación GPS: despachar de inmediato
     if (location) {
       await redis.del(`ask_name:${from}`);
 
@@ -1325,7 +1547,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       return;
     }
 
-    // 5. CAPTURA O SALUDO PERSONALIZADO POR NOMBRE PARA CLIENTES
+    // 5. CAPTURA O SALUDO PERSONALIZADO POR NOMBRE PARA CLIENTES CON HABEAS DATA ACEPTADO
     if (!passengerName) {
       const waitingName = await redis.get(`ask_name:${from}`);
 
@@ -1333,7 +1555,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         if (isInvalidNameInput(text)) {
           await sendText(
             from,
-            '😊 Para registrarte en *Taxi Caldas* y atenderte por tu nombre, dime por favor cómo te llamas *(Ej: Carlos Pérez)*:\n\n_(O envía directamente tu *ubicación actual* 📎 -> Ubicación si necesitas el taxi de inmediato)_'
+            '😊 Para completar tu registro en *Taxi Caldas* y llamarte por tu nombre, dime por favor cómo te llamas *(Ej: Carlos Pérez)*:\n\n_(O envía directamente tu *ubicación actual* 📎 -> Ubicación si necesitas el taxi de inmediato)_'
           );
           return;
         }
@@ -1352,23 +1574,22 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         return;
       }
 
-      // Primera vez que escribe este número: guardamos su registro y le pedimos su nombre
       await redis.set(`ask_name:${from}`, '1', 'EX', 3600);
       await sendText(
         from,
-        '👋 ¡Hola! Bienvenido a *Taxi Caldas*.\n\nPara brindarte una atención más rápida y personalizada, ¿cuál es tu *nombre*? 😊\n\n_(Si necesitas un taxi de inmediato, también puedes enviarme directamente tu *ubicación actual* 📎 -> Ubicación. Si eres conductor, escribe *SOY TAXISTA*)_'
+        '😊 Para brindarte una atención personalizada en *Taxi Caldas*, ¿cuál es tu *nombre y apellido*?\n\n_(O envía directamente tu *ubicación actual* 📎 -> Ubicación si necesitas el taxi de inmediato)_'
       );
       return;
     }
 
-    // Cliente ya registrado escribiendo por segunda vez o más: lo llamamos por su nombre
+    // Cliente ya registrado escribiendo por segunda vez o más: lo saludamos por su nombre
     await sendText(
       from,
       `👋 ¡Hola *${passengerName}*! Qué gusto saludarte de nuevo en *Taxi Caldas*.\n\n📍 Envíame tu *ubicación actual* (📎 -> Ubicación) para enviarte el taxi más cercano.`
     );
   } catch (err: any) {
     console.error('❌ Error procesando webhook:', err?.response?.data || err);
-    if (err?.code === '42P01') {
+    if (err?.code === '42P01' || err?.code === '42703') {
       await ensureDatabaseSchema(db);
     }
   }
@@ -1406,9 +1627,7 @@ async function registerWebhookOnBoot() {
 ensureDatabaseSchema(db).catch((e) => console.error('❌ Error DB init:', e));
 
 const PORT = Number(process.env.PORT) || 4000;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `🚀 Central de Taxis corriendo en http://localhost:${process.env.PORT}`
-  );
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Central de Taxis corriendo en http://localhost:${PORT}`);
   registerWebhookOnBoot();
 });

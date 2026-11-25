@@ -9,10 +9,15 @@ export async function ensureDatabaseSchema(db: Pool) {
       phone VARCHAR(35) UNIQUE NOT NULL,
       full_name VARCHAR(100),
       push_name VARCHAR(100),
+      data_consent BOOLEAN DEFAULT FALSE,
+      data_consent_at TIMESTAMP WITH TIME ZONE,
       trips_count INTEGER DEFAULT 0,
       last_interaction_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
       created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
+
+    ALTER TABLE passengers ADD COLUMN IF NOT EXISTS data_consent BOOLEAN DEFAULT FALSE;
+    ALTER TABLE passengers ADD COLUMN IF NOT EXISTS data_consent_at TIMESTAMP WITH TIME ZONE;
 
     CREATE TABLE IF NOT EXISTS drivers (
       id SERIAL PRIMARY KEY,
@@ -26,14 +31,21 @@ export async function ensureDatabaseSchema(db: Pool) {
       is_verified BOOLEAN DEFAULT FALSE,
       approval_status VARCHAR(20) DEFAULT 'PENDING',
       balance INTEGER DEFAULT 0,
+      profile_photo_path TEXT,
       doc_photo_path TEXT,
+      data_consent BOOLEAN DEFAULT FALSE,
+      data_consent_at TIMESTAMP WITH TIME ZONE,
       rating_avg NUMERIC(3,2) DEFAULT 5.00,
       rating_count INTEGER DEFAULT 0,
       created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
 
+    ALTER TABLE drivers ADD COLUMN IF NOT EXISTS profile_photo_path TEXT;
+    ALTER TABLE drivers ADD COLUMN IF NOT EXISTS data_consent BOOLEAN DEFAULT FALSE;
+    ALTER TABLE drivers ADD COLUMN IF NOT EXISTS data_consent_at TIMESTAMP WITH TIME ZONE;
+
     CREATE INDEX IF NOT EXISTS idx_drivers_location ON drivers USING GIST (location);
-    CREATE INDEX IF NOT EXISTS idx_drivers_status ON drivers (status);
+    CREATE INDEX IF NOT EXISTS idx_drivers_status ON drivers USING GIST (location);
 
     CREATE TABLE IF NOT EXISTS trips (
       id SERIAL PRIMARY KEY,
@@ -98,5 +110,5 @@ export async function ensureDatabaseSchema(db: Pool) {
       ('trip_commission', '500')
     ON CONFLICT (key) DO NOTHING;
   `);
-  console.log('✅ Esquema PostGIS y tablas (clientes + conductores) listos');
+  console.log('✅ Esquema PostGIS y columnas Habeas Data + Perfil verificados');
 }

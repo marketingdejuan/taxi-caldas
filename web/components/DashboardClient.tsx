@@ -50,7 +50,10 @@ interface Driver {
   balance: number;
   approval_status: string;
   is_verified: boolean;
+  profile_photo_path: string | null;
   doc_photo_path: string | null;
+  data_consent?: boolean;
+  data_consent_at?: string | null;
   rating_avg: string;
   rating_count: number;
   lat: number | null;
@@ -63,6 +66,8 @@ interface Passenger {
   phone: string;
   full_name: string | null;
   push_name: string | null;
+  data_consent?: boolean;
+  data_consent_at?: string | null;
   trips_count: number;
   last_interaction_at: string;
   created_at: string;
@@ -228,6 +233,8 @@ export default function DashboardClient() {
       'Nombre Registrado',
       'Perfil WhatsApp',
       'Telefono',
+      'Habeas Data (Ley 1581)',
+      'Fecha Autorizacion',
       'Servicios Pedidos',
       'Ultimo Contacto',
       'Fecha Registro',
@@ -237,6 +244,8 @@ export default function DashboardClient() {
       `"${(p.full_name || 'Pendiente').replace(/"/g, '""')}"`,
       `"${(p.push_name || '').replace(/"/g, '""')}"`,
       p.phone,
+      p.data_consent ? 'AUTORIZADO' : 'PENDIENTE',
+      p.data_consent_at ? new Date(p.data_consent_at).toLocaleString('es-CO') : '',
       p.trips_count,
       new Date(p.last_interaction_at).toLocaleString('es-CO'),
       new Date(p.created_at).toLocaleString('es-CO'),
@@ -929,6 +938,7 @@ export default function DashboardClient() {
                         <th className="px-5 py-3">ID</th>
                         <th className="px-5 py-3">Nombre del Cliente</th>
                         <th className="px-5 py-3">Teléfono WhatsApp</th>
+                        <th className="px-5 py-3">Habeas Data</th>
                         <th className="px-5 py-3">Servicios</th>
                         <th className="px-5 py-3">Última Interacción</th>
                         <th className="px-5 py-3">Registrado</th>
@@ -956,6 +966,17 @@ export default function DashboardClient() {
                           </td>
                           <td className="px-5 py-3 font-mono text-xs text-slate-700">
                             {p.phone}
+                          </td>
+                          <td className="px-5 py-3 text-xs">
+                            {p.data_consent ? (
+                              <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2.5 py-0.5 font-bold text-emerald-800">
+                                ✓ Ley 1581
+                              </span>
+                            ) : (
+                              <span className="inline-flex rounded-full bg-slate-100 px-2.5 py-0.5 font-semibold text-slate-600">
+                                Pendiente
+                              </span>
+                            )}
                           </td>
                           <td className="px-5 py-3">
                             <span className="inline-flex rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-bold text-amber-900">
@@ -1016,6 +1037,16 @@ export default function DashboardClient() {
                           </p>
                         </div>
 
+                        {drv.profile_photo_path && (
+                          <a
+                            href={`${backendUrl}/${drv.profile_photo_path}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-amber-300 bg-amber-100/70 px-2.5 py-1.5 text-xs font-semibold text-amber-950 hover:bg-amber-100 mr-1.5"
+                          >
+                            Foto Perfil <ExternalLink className="h-3.5 w-3.5" />
+                          </a>
+                        )}
                         {drv.doc_photo_path && (
                           <a
                             href={`${backendUrl}/${drv.doc_photo_path}`}

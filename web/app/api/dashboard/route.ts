@@ -15,10 +15,17 @@ export async function GET() {
         phone VARCHAR(35) UNIQUE NOT NULL,
         full_name VARCHAR(100),
         push_name VARCHAR(100),
+        data_consent BOOLEAN DEFAULT FALSE,
+        data_consent_at TIMESTAMP WITH TIME ZONE,
         trips_count INTEGER DEFAULT 0,
         last_interaction_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-      )
+      );
+      ALTER TABLE passengers ADD COLUMN IF NOT EXISTS data_consent BOOLEAN DEFAULT FALSE;
+      ALTER TABLE passengers ADD COLUMN IF NOT EXISTS data_consent_at TIMESTAMP WITH TIME ZONE;
+      ALTER TABLE drivers ADD COLUMN IF NOT EXISTS profile_photo_path TEXT;
+      ALTER TABLE drivers ADD COLUMN IF NOT EXISTS data_consent BOOLEAN DEFAULT FALSE;
+      ALTER TABLE drivers ADD COLUMN IF NOT EXISTS data_consent_at TIMESTAMP WITH TIME ZONE;
     `);
 
     const [driversRes, tripsRes, revenueRes, sosRes, passengersRes] =
@@ -34,7 +41,10 @@ export async function GET() {
             balance,
             approval_status,
             is_verified,
+            profile_photo_path,
             doc_photo_path,
+            data_consent,
+            data_consent_at,
             rating_avg,
             rating_count,
             ST_Y(location::geometry) AS lat,
@@ -104,6 +114,8 @@ export async function GET() {
             phone,
             full_name,
             push_name,
+            data_consent,
+            data_consent_at,
             trips_count,
             last_interaction_at,
             created_at
