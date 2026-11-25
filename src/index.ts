@@ -1,3 +1,4 @@
+import { ensureDatabaseSchema } from './initDb';
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
@@ -1041,8 +1042,11 @@ app.post('/webhook/whatsapp', async (req, res) => {
     }
   } catch (err: any) {
     console.error('❌ Error procesando webhook:', err?.response?.data || err);
+    if (err?.code === '42P01') { await ensureDatabaseSchema(db); }
   }
 });
+
+ensureDatabaseSchema(db).catch((e) => console.error("❌ Error DB init:", e));
 
 app.listen(process.env.PORT, () => {
   console.log(`🚀 Central de Taxis corriendo en http://localhost:${process.env.PORT}`);
