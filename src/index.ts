@@ -45,6 +45,7 @@ interface GeoPoint {
   lat: number;
   lng: number;
   label: string;
+  surcharge?: number;
 }
 
 const KNOWN_LANDMARKS: Array<{ keys: string[]; lat: number; lng: number; label: string }> = [
@@ -269,16 +270,117 @@ function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number)
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+function formatZoneTitle(zoneType: string, name: string): string {
+  if (zoneType === 'VEREDA') return `Vereda ${name}`;
+  if (zoneType === 'BARRIO') return `Barrio ${name}`;
+  return name;
+}
+
+async function findNearestCaldasZone(
+  lat: number,
+  lng: number
+): Promise<{ label: string; surcharge: number; distanceMeters: number } | null> {
+  try {
+    const res = await db.query(
+      `SELECT name, zone_type, surcharge,
+              ROUND(ST_Distance(location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography)) AS dist_m
+       FROM caldas_zones
+       WHERE ST_DWithin(location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 1800)
+       ORDER BY dist_m ASC
+       LIMIT 1`,
+      [lng, lat]
+    );
+    if (res.rows.length > 0) {
+      const r = res.rows[0];
+      return {
+        label: formatZoneTitle(r.zone_type, r.name),
+        surcharge: Number(r.surcharge || 0),
+        distanceMeters: Number(r.dist_m || 0),
+      };
+    }
+  } catch (err) {
+    console.error('Aviso buscando zona cercana en caldas_zones:', err);
+  }
+  return null;
+}
+
 async function resolvePlaceToCoords(rawPlace: string): Promise<GeoPoint | null> {
   const cleanKey = normalizeSearchKey(rawPlace);
-  if (!cleanKey || cleanKey.length < 3) return null;
+  if (!cleanKey || cleanKey.length < 2) return null;
 
+  // 1. Prioridad máxima: Base de datos de Barrios y Veredas de Caldas configurada en Admin
+  try {
+    const zonesRes = await db.query(
+      `SELECT id, name, zone_type, aliases, surcharge,
+              ST_Y(location::geometry) AS lat,
+              ST_X(location::geometry) AS lng
+       FROM caldas_zones`
+    );
+
+    const strippedQuery = cleanKey
+      .replace(/^(BARRIO|VEREDA|SECTOR|EL|LA|LOS|LAS)\s+/g, '')
+      .trim();
+
+    let bestPartial: any = null;
+
+    for (const z of zonesRes.rows) {
+      const candidates = [
+        z.name,
+        ...(String(z.aliases || '')
+          .split(',')
+          .map((a) => a.trim())
+          .filter(Boolean)),
+      ];
+
+      for (const cand of candidates) {
+        const normCand = normalizeSearchKey(cand);
+        const strippedCand = normCand
+          .replace(/^(BARRIO|VEREDA|SECTOR|EL|LA|LOS|LAS)\s+/g, '')
+          .trim();
+
+        if (
+          normCand === cleanKey ||
+          (strippedQuery.length >= 3 && strippedCand === strippedQuery)
+        ) {
+          return {
+            lat: Number(z.lat),
+            lng: Number(z.lng),
+            label: formatZoneTitle(z.zone_type, z.name),
+            surcharge: Number(z.surcharge || 0),
+          };
+        }
+
+        if (
+          !bestPartial &&
+          strippedQuery.length >= 4 &&
+          (normCand.includes(strippedQuery) || strippedQuery.includes(strippedCand)) &&
+          strippedCand.length >= 4
+        ) {
+          bestPartial = z;
+        }
+      }
+    }
+
+    if (bestPartial) {
+      return {
+        lat: Number(bestPartial.lat),
+        lng: Number(bestPartial.lng),
+        label: formatZoneTitle(bestPartial.zone_type, bestPartial.name),
+        surcharge: Number(bestPartial.surcharge || 0),
+      };
+    }
+  } catch (err) {
+    console.error('Aviso consultando caldas_zones:', err);
+  }
+
+  // 2. Puntos metropolitanos de referencia fuera de Caldas
   for (const lm of KNOWN_LANDMARKS) {
     if (lm.keys.some((k) => cleanKey === k || cleanKey.includes(k))) {
-      return { lat: lm.lat, lng: lm.lng, label: lm.label };
+      return { lat: lm.lat, lng: lm.lng, label: lm.label, surcharge: 0 };
     }
   }
 
+  // 3. Geocodificación abierta en Caldas / Antioquia
   try {
     const query = `${rawPlace.trim()}, Caldas, Antioquia, Colombia`;
     const res = await axios.get('https://nominatim.openstreetmap.org/search', {
@@ -303,6 +405,7 @@ async function resolvePlaceToCoords(rawPlace: string): Promise<GeoPoint | null> 
         lat: Number(hit.lat),
         lng: Number(hit.lon),
         label: shortName || rawPlace.trim(),
+        surcharge: 0,
       };
     }
 
@@ -328,6 +431,7 @@ async function resolvePlaceToCoords(rawPlace: string): Promise<GeoPoint | null> 
         lat: Number(hit.lat),
         lng: Number(hit.lon),
         label: shortName || rawPlace.trim(),
+        surcharge: 0,
       };
     }
   } catch (err) {
@@ -372,7 +476,8 @@ async function calculateRouteQuote(
 
   const distanceKm = Number((distanceMeters / 1000).toFixed(1));
   const durationMinutes = Math.max(3, Math.round(durationSeconds / 60));
-  const rawFare = tariffs.baseFare + distanceKm * tariffs.pricePerKm;
+  const zoneSurcharge = Math.max(Number(origin.surcharge || 0), Number(destination.surcharge || 0));
+  const rawFare = tariffs.baseFare + distanceKm * tariffs.pricePerKm + zoneSurcharge;
   const roundedFare = Math.round(rawFare / 100) * 100;
   const estimatedFare = Math.max(tariffs.minFare, roundedFare);
 
@@ -706,6 +811,7 @@ async function broadcastTripOffer(
   drivers: Array<{ id: number; phone: string; distance_meters: string | number }>,
   tripInfo: {
     id: number;
+    pickupAddress?: string | null;
     dropoffAddress?: string | null;
     distanceKm?: number | null;
     estimatedFare?: number | null;
@@ -734,7 +840,7 @@ async function broadcastTripOffer(
     await sendText(
       drv.phone,
       `${header}\n\n` +
-        `📍 *Recogida (A):* a *${drv.distance_meters} metros* de ti` +
+        `📍 *Recogida (A):* ${tripInfo.pickupAddress ? `*${tripInfo.pickupAddress}* ` : ''}(a *${drv.distance_meters} m* de ti)` +
         `${routeDetails}\n` +
         `💸 *Comisión central:* ${formatCOP(tripCommission)}\n\n` +
         `Responde *1* o *YO* para tomarlo.`
@@ -940,6 +1046,7 @@ async function dispatchTripFromPickup(params: {
 
   const tripInfo = {
     id: tripId,
+    pickupAddress: pickup.label || null,
     dropoffAddress: dropoff?.label || null,
     distanceKm: distanceKm ?? null,
     estimatedFare: estimatedFare ?? null,
@@ -967,6 +1074,128 @@ async function dispatchTripFromPickup(params: {
 app.get(['/', '/health'], (_req, res) =>
   res.json({ ok: true, service: 'taxi-caldas-backend' })
 );
+
+app.get('/admin/zones', async (_req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT
+        id,
+        name,
+        zone_type,
+        aliases,
+        surcharge,
+        ST_Y(location::geometry) AS lat,
+        ST_X(location::geometry) AS lng,
+        created_at,
+        updated_at
+      FROM caldas_zones
+      ORDER BY
+        CASE zone_type WHEN 'BARRIO' THEN 0 WHEN 'VEREDA' THEN 1 ELSE 2 END,
+        name ASC
+    `);
+    res.json({ zones: result.rows });
+  } catch (err) {
+    console.error('Error en GET /admin/zones:', err);
+    res.status(500).json({ error: 'Error consultando barrios y veredas' });
+  }
+});
+
+app.post('/admin/zones', async (req, res) => {
+  try {
+    const { name, zoneType, aliases, surcharge, lat, lng } = req.body;
+    const cleanName = String(name || '').trim();
+    const numLat = Number(lat);
+    const numLng = Number(lng);
+    const numSurcharge = Math.max(0, Number(surcharge || 0));
+    const validType = ['BARRIO', 'VEREDA', 'PUNTO_INTERES'].includes(zoneType)
+      ? zoneType
+      : 'BARRIO';
+
+    if (cleanName.length < 2 || isNaN(numLat) || isNaN(numLng)) {
+      res.status(400).json({ error: 'Nombre y coordenadas válidas en el mapa son obligatorios.' });
+      return;
+    }
+
+    const inserted = await db.query(
+      `INSERT INTO caldas_zones (name, zone_type, aliases, surcharge, location)
+       VALUES ($1, $2, $3, $4, ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography)
+       RETURNING id, name, zone_type, aliases, surcharge,
+                 ST_Y(location::geometry) AS lat, ST_X(location::geometry) AS lng`,
+      [cleanName, validType, String(aliases || '').trim(), numSurcharge, numLng, numLat]
+    );
+
+    res.json({ ok: true, zone: inserted.rows[0] });
+  } catch (err: any) {
+    if (err?.code === '23505') {
+      res.status(409).json({ error: 'Ya existe un barrio o vereda con ese nombre.' });
+      return;
+    }
+    console.error('Error en POST /admin/zones:', err);
+    res.status(500).json({ error: 'Error creando barrio o vereda' });
+  }
+});
+
+app.put('/admin/zones/:id', async (req, res) => {
+  try {
+    const zoneId = Number(req.params.id);
+    const { name, zoneType, aliases, surcharge, lat, lng } = req.body;
+    const cleanName = String(name || '').trim();
+    const numLat = Number(lat);
+    const numLng = Number(lng);
+    const numSurcharge = Math.max(0, Number(surcharge || 0));
+    const validType = ['BARRIO', 'VEREDA', 'PUNTO_INTERES'].includes(zoneType)
+      ? zoneType
+      : 'BARRIO';
+
+    if (!zoneId || cleanName.length < 2 || isNaN(numLat) || isNaN(numLng)) {
+      res.status(400).json({ error: 'Datos inválidos para actualizar la zona.' });
+      return;
+    }
+
+    const updated = await db.query(
+      `UPDATE caldas_zones
+       SET name = $1,
+           zone_type = $2,
+           aliases = $3,
+           surcharge = $4,
+           location = ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography,
+           updated_at = NOW()
+       WHERE id = $7
+       RETURNING id, name, zone_type, aliases, surcharge,
+                 ST_Y(location::geometry) AS lat, ST_X(location::geometry) AS lng`,
+      [cleanName, validType, String(aliases || '').trim(), numSurcharge, numLng, numLat, zoneId]
+    );
+
+    if (updated.rows.length === 0) {
+      res.status(404).json({ error: 'Barrio o vereda no encontrado.' });
+      return;
+    }
+
+    res.json({ ok: true, zone: updated.rows[0] });
+  } catch (err: any) {
+    if (err?.code === '23505') {
+      res.status(409).json({ error: 'Ya existe otro barrio o vereda con ese nombre.' });
+      return;
+    }
+    console.error('Error en PUT /admin/zones/:id:', err);
+    res.status(500).json({ error: 'Error actualizando barrio o vereda' });
+  }
+});
+
+app.delete('/admin/zones/:id', async (req, res) => {
+  try {
+    const zoneId = Number(req.params.id);
+    if (!zoneId) {
+      res.status(400).json({ error: 'ID inválido' });
+      return;
+    }
+    await db.query(`DELETE FROM caldas_zones WHERE id = $1`, [zoneId]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Error en DELETE /admin/zones/:id:', err);
+    res.status(500).json({ error: 'Error eliminando barrio o vereda' });
+  }
+});
 
 app.post('/admin/send-trip-message', async (req, res) => {
   try {
@@ -2748,10 +2977,12 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       if (qState.step === 'ASK_ORIGIN') {
         let originPoint: GeoPoint | null = null;
         if (location) {
+          const nearA = await findNearestCaldasZone(location.degreesLatitude, location.degreesLongitude);
           originPoint = {
             lat: location.degreesLatitude,
             lng: location.degreesLongitude,
-            label: 'Ubicación GPS compartida (Origen)',
+            label: nearA ? `${nearA.label} (GPS)` : 'Ubicación GPS compartida (Origen)',
+            surcharge: nearA?.surcharge || 0,
           };
         } else if (text) {
           originPoint = await resolvePlaceToCoords(text);
@@ -2782,10 +3013,12 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       if (qState.step === 'ASK_DESTINATION') {
         let destPoint: GeoPoint | null = null;
         if (location) {
+          const nearB = await findNearestCaldasZone(location.degreesLatitude, location.degreesLongitude);
           destPoint = {
             lat: location.degreesLatitude,
             lng: location.degreesLongitude,
-            label: 'Ubicación GPS de destino',
+            label: nearB ? `${nearB.label} (GPS)` : 'Ubicación GPS de destino',
+            surcharge: nearB?.surcharge || 0,
           };
         } else if (text) {
           destPoint = await resolvePlaceToCoords(text);
@@ -2879,10 +3112,12 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
       let destPoint: GeoPoint | null = null;
       if (location) {
+        const nearB2 = await findNearestCaldasZone(location.degreesLatitude, location.degreesLongitude);
         destPoint = {
           lat: location.degreesLatitude,
           lng: location.degreesLongitude,
-          label: 'Ubicación GPS de destino',
+          label: nearB2 ? `${nearB2.label} (GPS)` : 'Ubicación GPS de destino',
+          surcharge: nearB2?.surcharge || 0,
         };
       } else if (text) {
         destPoint = await resolvePlaceToCoords(text);
@@ -2931,10 +3166,12 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
     if (location) {
       await redis.del(`ask_name:${from}`);
+      const nearPickup = await findNearestCaldasZone(location.degreesLatitude, location.degreesLongitude);
       const pickupPoint: GeoPoint = {
         lat: location.degreesLatitude,
         lng: location.degreesLongitude,
-        label: 'Ubicación GPS compartida',
+        label: nearPickup ? `${nearPickup.label} (GPS)` : 'Ubicación GPS compartida',
+        surcharge: nearPickup?.surcharge || 0,
       };
       const token = `${Date.now()}`;
 
@@ -2948,7 +3185,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       await sendText(
         from,
         `🚖 *CENTRAL TAXI CALDAS:*\n` +
-          `📍 *Punto A (Recogida)* recibido${passengerName ? `, *${passengerName}*` : ''}.\n\n` +
+          `📍 *Punto A (Recogida):* *${pickupPoint.label}*${passengerName ? ` (${passengerName})` : ''}\n\n` +
           `¿Deseas conocer el *valor aproximado* antes de pedir?\n` +
           `• Escribe tu *destino (Punto B)* (ej: _Mayorca_, _Parque de Caldas_) o envía el *pin GPS de destino*\n` +
           `• O responde *1* / *DIRECTO* para buscar tu taxi de inmediato.`
