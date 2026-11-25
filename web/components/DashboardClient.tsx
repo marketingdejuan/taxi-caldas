@@ -1229,7 +1229,7 @@ export default function DashboardClient() {
                       >
                         <option value="BARRIO">Barrio Urbano</option>
                         <option value="VEREDA">Vereda Rural</option>
-                        <option value="PUNTO_INTERES">Punto de Interés</option>
+                        <option value="PUNTO_INTERES">Unidad / Punto de Referencia</option>
                       </select>
                     </div>
 
@@ -1425,11 +1425,21 @@ export default function DashboardClient() {
                                 ? 'Vereda'
                                 : z.zone_type === 'BARRIO'
                                 ? 'Barrio'
-                                : 'Punto'}
+                                : 'Unidad / Punto'}
                             </span>
                           </td>
-                          <td className="px-4 py-3 text-xs text-slate-500 max-w-[220px] truncate">
-                            {z.aliases || '—'}
+                          <td className="px-4 py-3 text-xs text-slate-500 max-w-[240px]">
+                            <div className="truncate">{z.aliases || "—"}</div>
+                            {(z as any).parent_zone && (
+                              <div className="text-[11px] font-semibold text-blue-700">
+                                Sector: {(z as any).parent_zone}
+                              </div>
+                            )}
+                            {(z as any).entry_note && (
+                              <div className="text-[11px] font-semibold text-amber-800">
+                                🚧 {(z as any).entry_note}
+                              </div>
+                            )}
                           </td>
                           <td className="px-4 py-3 font-mono text-[11px] text-slate-600">
                             {Number(z.lat).toFixed(5)}, {Number(z.lng).toFixed(5)}

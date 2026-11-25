@@ -78,11 +78,15 @@ export async function ensureDatabaseSchema(db: Pool) {
       zone_type VARCHAR(20) NOT NULL DEFAULT 'BARRIO',
       aliases TEXT DEFAULT '',
       surcharge INTEGER DEFAULT 0,
+      parent_zone VARCHAR(120) DEFAULT '',
+      entry_note VARCHAR(120) DEFAULT '',
       location GEOGRAPHY(Point, 4326) NOT NULL,
       created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
       updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
 
+    ALTER TABLE caldas_zones ADD COLUMN IF NOT EXISTS parent_zone VARCHAR(120) DEFAULT '';
+    ALTER TABLE caldas_zones ADD COLUMN IF NOT EXISTS entry_note VARCHAR(120) DEFAULT '';
     CREATE INDEX IF NOT EXISTS idx_caldas_zones_location ON caldas_zones USING GIST (location);
 
     CREATE TABLE IF NOT EXISTS passengers (

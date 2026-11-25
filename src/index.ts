@@ -46,45 +46,13 @@ interface GeoPoint {
   lng: number;
   label: string;
   surcharge?: number;
+  zoneType?: string;
+  parentZone?: string;
+  entryNote?: string;
+  fromDb?: boolean;
 }
 
 const KNOWN_LANDMARKS: Array<{ keys: string[]; lat: number; lng: number; label: string }> = [
-  {
-    keys: ['PARQUE DE CALDAS', 'PARQUE PRINCIPAL CALDAS', 'PARQUE CALDAS', 'CENTRO CALDAS'],
-    lat: 6.0910,
-    lng: -75.6357,
-    label: 'Parque Principal de Caldas',
-  },
-  {
-    keys: ['VARIANTE CALDAS', 'LA VARIANTE'],
-    lat: 6.0962,
-    lng: -75.6388,
-    label: 'La Variante, Caldas',
-  },
-  {
-    keys: ['LA MIEL', 'VEREDA LA MIEL'],
-    lat: 6.0772,
-    lng: -75.6295,
-    label: 'La Miel, Caldas',
-  },
-  {
-    keys: ['SALINAS', 'VEREDA SALINAS'],
-    lat: 6.0745,
-    lng: -75.6472,
-    label: 'Vereda Salinas, Caldas',
-  },
-  {
-    keys: ['LOCERIA', 'LA LOCERIA'],
-    lat: 6.0994,
-    lng: -75.6331,
-    label: 'La Locería, Caldas',
-  },
-  {
-    keys: ['HOSPITAL CALDAS', 'HOSPITAL SAN VICENTE CALDAS'],
-    lat: 6.0885,
-    lng: -75.6341,
-    label: 'Hospital San Vicente de Paúl, Caldas',
-  },
   {
     keys: ['ESTACION LA ESTRELLA', 'METRO LA ESTRELLA'],
     lat: 6.1578,
@@ -155,24 +123,167 @@ function normalizeSearchKey(text: string): string {
     .toUpperCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[¡!¿?.,]/g, '')
+    .replace(/[¡!¿?.,;:()"]/g, ' ')
+    .replace(/\s+/g, ' ')
     .trim();
 }
 
+// Normalización fonética en español para tolerar errores ortográficos (b/v, s/z/c, ll/y, h muda, letras repetidas)
+function phoneticSpanish(text: string): string {
+  return normalizeSearchKey(text)
+    .toLowerCase()
+    .replace(/(.)\1+/g, '$1')
+    .replace(/h/g, '')
+    .replace(/v/g, 'b')
+    .replace(/z/g, 's')
+    .replace(/c([ei])/g, 's$1')
+    .replace(/qu/g, 'k')
+    .replace(/c([aou])/g, 'k$1')
+    .replace(/ll/g, 'y')
+    .replace(/gu([ei])/g, 'g$1')
+    .trim();
+}
+
+function levenshtein(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  const dp: number[][] = Array.from({ length: m + 1 }, () =>
+    new Array(n + 1).fill(0)
+  );
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost
+      );
+    }
+  }
+  return dp[m][n];
+}
+
+function fuzzySimilarity(rawA: string, rawB: string): number {
+  const a = phoneticSpanish(rawA);
+  const b = phoneticSpanish(rawB);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const dist = levenshtein(a, b);
+  return 1 - dist / Math.max(a.length, b.length);
+}
+
+function matchesFuzzyVocabulary(input: string, vocab: string[], threshold = 0.78): boolean {
+  const clean = normalizeSearchKey(input);
+  if (!clean) return false;
+  for (const word of vocab) {
+    if (clean === word) return true;
+    if (clean.length >= 3 && word.length >= 3 && fuzzySimilarity(clean, word) >= threshold) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isFuzzyYes(text: string): boolean {
+  return matchesFuzzyVocabulary(text, [
+    'SI',
+    'SII',
+    'ZI',
+    'CI',
+    'OK',
+    'OKI',
+    'DALE',
+    'CLARO',
+    'CORRECTO',
+    'CORECTO',
+    'EXACTO',
+    'ESACTO',
+    'AFIRMATIVO',
+    'DE ACUERDO',
+    'SIMON',
+    'SEP',
+    'CONFIRMO',
+    'ASI ES',
+    'ESTA BIEN',
+  ]);
+}
+
+function isFuzzyNoOrSkip(text: string): boolean {
+  return matchesFuzzyVocabulary(text, [
+    'NO',
+    'NOP',
+    'NOPE',
+    'NEL',
+    'NEGATIVO',
+    'OMITIR',
+    'SALTAR',
+    'NINGUNO',
+    'NINGUNA',
+    'SIN DESTINO',
+    'DIRECTO',
+    'NO QUIERO',
+    'NO SE',
+    'TAMPOCO',
+    'NO APLICA',
+  ]);
+}
+
+function parseEntryPreference(text: string): 'PORTERIA' | 'INGRESO' | null {
+  const clean = normalizeSearchKey(text);
+  if (clean === '1') return 'PORTERIA';
+  if (clean === '2') return 'INGRESO';
+
+  const phon = phoneticSpanish(text);
+  if (
+    /porteria|portera|afuera|entrada|en la puerta|espera afuera|no dejan/.test(
+      phon
+    ) ||
+    matchesFuzzyVocabulary(text, ['PORTERIA', 'EN PORTERIA', 'AFUERA', 'ENTRADA'], 0.72)
+  ) {
+    return 'PORTERIA';
+  }
+  if (
+    /ingresar|ingreso|entrar|entra|adentro|dejan entrar|puede entrar|hasta la casa|hasta el bloke|hasta la tore/.test(
+      phon
+    ) ||
+    matchesFuzzyVocabulary(
+      text,
+      ['INGRESAR', 'PUEDE INGRESAR', 'ENTRAR', 'ADENTRO', 'SI ENTRA'],
+      0.72
+    )
+  ) {
+    return 'INGRESO';
+  }
+  return null;
+}
+
 function isConsentAccepted(upperText: string): boolean {
-  return ['ACEPTO', 'ACEPTAR', 'SI', 'SÍ', 'AUTORIZO', 'DE ACUERDO', 'OK', '1'].includes(
-    upperText.trim()
+  return (
+    upperText.trim() === '1' ||
+    matchesFuzzyVocabulary(upperText, [
+      'ACEPTO',
+      'ACEPTAR',
+      'ASEPTO',
+      'SI',
+      'AUTORIZO',
+      'DE ACUERDO',
+      'OK',
+    ])
   );
 }
 
 function isConsentRejected(upperText: string): boolean {
-  return ['NO', 'NO ACEPTO', 'RECHAZO'].includes(upperText.trim());
+  return matchesFuzzyVocabulary(upperText, ['NO', 'NO ACEPTO', 'RECHAZO']);
 }
 
 function isQuoteIntent(upperText: string): boolean {
   const clean = normalizeSearchKey(upperText);
   return (
-    [
+    matchesFuzzyVocabulary(clean, [
       'COTIZAR',
       'COTIZACION',
       'TARIFA',
@@ -182,7 +293,7 @@ function isQuoteIntent(upperText: string): boolean {
       'CUANTO CUESTA',
       'VALOR CARRERA',
       'SIMULAR',
-    ].includes(clean) || clean.startsWith('COTIZAR ')
+    ]) || clean.startsWith('COTIZAR ')
   );
 }
 
@@ -190,24 +301,27 @@ function isAmbiguousTaxiOrDriverIntent(upperText: string): boolean {
   const clean = normalizeSearchKey(upperText);
   if (!clean) return false;
 
-  const exactMatches = [
-    'TAXI',
-    'SOY TAXI',
-    'SOY TAXISTA',
-    'SOY CONDUCTOR',
-    'CONDUCTOR',
-    'TAXISTA',
-    'REGISTRO',
-    'REGISTRARME',
-    'AFILIAR',
-    'AFILIARME',
-    'TRABAJAR',
-    'QUIERO TRABAJAR',
-    'MANEJO TAXI',
-    'TENGO TAXI',
-    'UN TAXI',
-  ];
-  if (exactMatches.includes(clean)) return true;
+  if (
+    matchesFuzzyVocabulary(clean, [
+      'TAXI',
+      'SOY TAXI',
+      'SOY TAXISTA',
+      'SOY CONDUCTOR',
+      'CONDUCTOR',
+      'TAXISTA',
+      'REGISTRO',
+      'REGISTRARME',
+      'AFILIAR',
+      'AFILIARME',
+      'TRABAJAR',
+      'QUIERO TRABAJAR',
+      'MANEJO TAXI',
+      'TENGO TAXI',
+      'UN TAXI',
+    ])
+  ) {
+    return true;
+  }
 
   return /\b(SOY TAXI|SOY TAXISTA|SOY CONDUCTOR|REGISTRAR MI VEHICULO|AFILIAR TAXI|TRABAJAR EN TAXI)\b/.test(
     clean
@@ -215,8 +329,7 @@ function isAmbiguousTaxiOrDriverIntent(upperText: string): boolean {
 }
 
 function isDriverWantingPassengerMode(upperText: string): boolean {
-  const clean = normalizeSearchKey(upperText);
-  return [
+  return matchesFuzzyVocabulary(upperText, [
     'PEDIR TAXI',
     'NECESITO UN TAXI',
     'NECESITO TAXI',
@@ -225,14 +338,14 @@ function isDriverWantingPassengerMode(upperText: string): boolean {
     'MODO PASAJERO',
     'SOY PASAJERO',
     'PEDIR SERVICIO',
-  ].includes(clean);
+  ]);
 }
 
 function isInvalidNameInput(text: string): boolean {
   const clean = text.trim();
   if (clean.length < 2 || clean.length > 45) return true;
   if (/[0-9@/:]/.test(clean)) return true;
-  const blockedWords = [
+  return matchesFuzzyVocabulary(clean, [
     'HOLA',
     'HOLI',
     'BUENAS',
@@ -255,8 +368,7 @@ function isInvalidNameInput(text: string): boolean {
     'NO',
     'ACEPTO',
     'COTIZAR',
-  ];
-  return blockedWords.includes(normalizeSearchKey(clean));
+  ]);
 }
 
 function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
@@ -272,56 +384,109 @@ function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number)
 
 function formatZoneTitle(zoneType: string, name: string): string {
   if (zoneType === 'VEREDA') return `Vereda ${name}`;
-  if (zoneType === 'BARRIO') return `Barrio ${name}`;
+  if (zoneType === 'BARRIO') {
+    return /^barrio\s+/i.test(name) ? name : `Barrio ${name}`;
+  }
   return name;
 }
 
-async function findNearestCaldasZone(
-  lat: number,
-  lng: number
-): Promise<{ label: string; surcharge: number; distanceMeters: number } | null> {
+// Busca candidatos cercanos en caldas_zones: unidades/puntos (<= 450m) + barrio/vereda más cercano (<= 1800m)
+async function findPickupCandidates(lat: number, lng: number): Promise<{
+  options: GeoPoint[];
+  nearestBarrio: GeoPoint | null;
+}> {
+  const options: GeoPoint[] = [];
+  let nearestBarrio: GeoPoint | null = null;
+
   try {
-    const res = await db.query(
-      `SELECT name, zone_type, surcharge,
-              ROUND(ST_Distance(location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography)) AS dist_m
-       FROM caldas_zones
-       WHERE ST_DWithin(location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 1800)
-       ORDER BY dist_m ASC
-       LIMIT 1`,
-      [lng, lat]
-    );
-    if (res.rows.length > 0) {
-      const r = res.rows[0];
-      return {
+    const [poiRes, areaRes] = await Promise.all([
+      db.query(
+        `SELECT id, name, zone_type, surcharge, parent_zone, entry_note,
+                ST_Y(location::geometry) AS lat,
+                ST_X(location::geometry) AS lng,
+                ROUND(ST_Distance(location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography)) AS dist_m
+         FROM caldas_zones
+         WHERE zone_type = 'PUNTO_INTERES'
+           AND ST_DWithin(location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 450)
+         ORDER BY dist_m ASC
+         LIMIT 2`,
+        [lng, lat]
+      ),
+      db.query(
+        `SELECT id, name, zone_type, surcharge, parent_zone, entry_note,
+                ST_Y(location::geometry) AS lat,
+                ST_X(location::geometry) AS lng,
+                ROUND(ST_Distance(location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography)) AS dist_m
+         FROM caldas_zones
+         WHERE zone_type IN ('BARRIO', 'VEREDA')
+           AND ST_DWithin(location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 1800)
+         ORDER BY dist_m ASC
+         LIMIT 2`,
+        [lng, lat]
+      ),
+    ]);
+
+    for (const r of poiRes.rows) {
+      options.push({
+        lat: Number(r.lat),
+        lng: Number(r.lng),
         label: formatZoneTitle(r.zone_type, r.name),
         surcharge: Number(r.surcharge || 0),
-        distanceMeters: Number(r.dist_m || 0),
+        zoneType: r.zone_type,
+        parentZone: r.parent_zone || '',
+        entryNote: r.entry_note || '',
+        fromDb: true,
+      });
+    }
+
+    for (const r of areaRes.rows) {
+      const pt: GeoPoint = {
+        lat: Number(r.lat),
+        lng: Number(r.lng),
+        label: formatZoneTitle(r.zone_type, r.name),
+        surcharge: Number(r.surcharge || 0),
+        zoneType: r.zone_type,
+        parentZone: r.parent_zone || '',
+        entryNote: r.entry_note || '',
+        fromDb: true,
       };
+      if (!nearestBarrio) nearestBarrio = pt;
+      if (options.length < 3) {
+        options.push(pt);
+      }
     }
   } catch (err) {
-    console.error('Aviso buscando zona cercana en caldas_zones:', err);
+    console.error('Aviso buscando candidatos de recogida:', err);
   }
-  return null;
+
+  return { options, nearestBarrio };
 }
 
-async function resolvePlaceToCoords(rawPlace: string): Promise<GeoPoint | null> {
+// Búsqueda inteligente y tolerante a errores ortográficos en caldas_zones + puntos metropolitanos
+async function resolvePlaceToCoords(
+  rawPlace: string,
+  allowOpenGeocode = true
+): Promise<GeoPoint | null> {
   const cleanKey = normalizeSearchKey(rawPlace);
   if (!cleanKey || cleanKey.length < 2) return null;
 
-  // 1. Prioridad máxima: Base de datos de Barrios y Veredas de Caldas configurada en Admin
+  const stripPrefix = (s: string) =>
+    normalizeSearchKey(s)
+      .replace(/^(BARRIO|BARRUO|BARIO|VEREDA|BEREDA|UNIDAD|CONJUNTO|EDIFICIO|SECTOR|EL|LA|LOS|LAS)\s+/g, '')
+      .trim();
+
+  const strippedQuery = stripPrefix(cleanKey);
+
+  // 1. Prioridad máxima: Base de datos de Barrios, Veredas y Unidades de Caldas
   try {
     const zonesRes = await db.query(
-      `SELECT id, name, zone_type, aliases, surcharge,
+      `SELECT id, name, zone_type, aliases, surcharge, parent_zone, entry_note,
               ST_Y(location::geometry) AS lat,
               ST_X(location::geometry) AS lng
        FROM caldas_zones`
     );
 
-    const strippedQuery = cleanKey
-      .replace(/^(BARRIO|VEREDA|SECTOR|EL|LA|LOS|LAS)\s+/g, '')
-      .trim();
-
-    let bestPartial: any = null;
+    let bestMatch: { row: any; score: number } | null = null;
 
     for (const z of zonesRes.rows) {
       const candidates = [
@@ -334,9 +499,7 @@ async function resolvePlaceToCoords(rawPlace: string): Promise<GeoPoint | null> 
 
       for (const cand of candidates) {
         const normCand = normalizeSearchKey(cand);
-        const strippedCand = normCand
-          .replace(/^(BARRIO|VEREDA|SECTOR|EL|LA|LOS|LAS)\s+/g, '')
-          .trim();
+        const strippedCand = stripPrefix(normCand);
 
         if (
           normCand === cleanKey ||
@@ -347,26 +510,43 @@ async function resolvePlaceToCoords(rawPlace: string): Promise<GeoPoint | null> 
             lng: Number(z.lng),
             label: formatZoneTitle(z.zone_type, z.name),
             surcharge: Number(z.surcharge || 0),
+            zoneType: z.zone_type,
+            parentZone: z.parent_zone || '',
+            entryNote: z.entry_note || '',
+            fromDb: true,
           };
         }
 
-        if (
-          !bestPartial &&
+        const simFull = fuzzySimilarity(cleanKey, normCand);
+        const simStripped =
+          strippedQuery.length >= 3 && strippedCand.length >= 3
+            ? fuzzySimilarity(strippedQuery, strippedCand)
+            : 0;
+        const containsBonus =
           strippedQuery.length >= 4 &&
-          (normCand.includes(strippedQuery) || strippedQuery.includes(strippedCand)) &&
-          strippedCand.length >= 4
-        ) {
-          bestPartial = z;
+          strippedCand.length >= 4 &&
+          (normCand.includes(strippedQuery) || strippedQuery.includes(strippedCand))
+            ? 0.85
+            : 0;
+
+        const score = Math.max(simFull, simStripped, containsBonus);
+        if (score >= 0.76 && (!bestMatch || score > bestMatch.score)) {
+          bestMatch = { row: z, score };
         }
       }
     }
 
-    if (bestPartial) {
+    if (bestMatch) {
+      const z = bestMatch.row;
       return {
-        lat: Number(bestPartial.lat),
-        lng: Number(bestPartial.lng),
-        label: formatZoneTitle(bestPartial.zone_type, bestPartial.name),
-        surcharge: Number(bestPartial.surcharge || 0),
+        lat: Number(z.lat),
+        lng: Number(z.lng),
+        label: formatZoneTitle(z.zone_type, z.name),
+        surcharge: Number(z.surcharge || 0),
+        zoneType: z.zone_type,
+        parentZone: z.parent_zone || '',
+        entryNote: z.entry_note || '',
+        fromDb: true,
       };
     }
   } catch (err) {
@@ -375,17 +555,30 @@ async function resolvePlaceToCoords(rawPlace: string): Promise<GeoPoint | null> 
 
   // 2. Puntos metropolitanos de referencia fuera de Caldas
   for (const lm of KNOWN_LANDMARKS) {
-    if (lm.keys.some((k) => cleanKey === k || cleanKey.includes(k))) {
-      return { lat: lm.lat, lng: lm.lng, label: lm.label, surcharge: 0 };
+    for (const k of lm.keys) {
+      if (
+        cleanKey === k ||
+        cleanKey.includes(k) ||
+        fuzzySimilarity(cleanKey, k) >= 0.78
+      ) {
+        return {
+          lat: lm.lat,
+          lng: lm.lng,
+          label: lm.label,
+          surcharge: 0,
+          fromDb: true,
+        };
+      }
     }
   }
 
-  // 3. Geocodificación abierta en Caldas / Antioquia
+  if (!allowOpenGeocode) return null;
+
+  // 3. Geocodificación abierta (direcciones o lugares fuera de la tabla local)
   try {
-    const query = `${rawPlace.trim()}, Caldas, Antioquia, Colombia`;
     const res = await axios.get('https://nominatim.openstreetmap.org/search', {
       params: {
-        q: query,
+        q: `${rawPlace.trim()}, Caldas, Antioquia, Colombia`,
         format: 'json',
         limit: 1,
         countrycodes: 'co',
@@ -406,6 +599,7 @@ async function resolvePlaceToCoords(rawPlace: string): Promise<GeoPoint | null> 
         lng: Number(hit.lon),
         label: shortName || rawPlace.trim(),
         surcharge: 0,
+        fromDb: false,
       };
     }
 
@@ -432,6 +626,7 @@ async function resolvePlaceToCoords(rawPlace: string): Promise<GeoPoint | null> 
         lng: Number(hit.lon),
         label: shortName || rawPlace.trim(),
         surcharge: 0,
+        fromDb: false,
       };
     }
   } catch (err) {
@@ -439,6 +634,41 @@ async function resolvePlaceToCoords(rawPlace: string): Promise<GeoPoint | null> 
   }
 
   return null;
+}
+
+// Guardar automáticamente una nueva unidad residencial / edificio alimentada por un usuario con su pin GPS
+async function saveUserDiscoveredLandmark(params: {
+  name: string;
+  lat: number;
+  lng: number;
+  parentZone?: string;
+  entryNote?: string;
+  surcharge?: number;
+}) {
+  const cleanName = formatProperName(params.name);
+  if (cleanName.length < 3) return;
+
+  try {
+    await db.query(
+      `INSERT INTO caldas_zones (name, zone_type, aliases, surcharge, parent_zone, entry_note, location)
+       VALUES ($1, 'PUNTO_INTERES', $2, $3, $4, $5, ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography)
+       ON CONFLICT (name) DO UPDATE SET
+         parent_zone = COALESCE(NULLIF(EXCLUDED.parent_zone, ''), caldas_zones.parent_zone),
+         entry_note = COALESCE(NULLIF(EXCLUDED.entry_note, ''), caldas_zones.entry_note),
+         updated_at = NOW()`,
+      [
+        cleanName,
+        cleanName,
+        Number(params.surcharge || 0),
+        params.parentZone || '',
+        params.entryNote || '',
+        params.lng,
+        params.lat,
+      ]
+    );
+  } catch (err) {
+    console.error('Aviso guardando nueva unidad/referencia de usuario:', err);
+  }
 }
 
 async function calculateRouteQuote(
@@ -476,7 +706,10 @@ async function calculateRouteQuote(
 
   const distanceKm = Number((distanceMeters / 1000).toFixed(1));
   const durationMinutes = Math.max(3, Math.round(durationSeconds / 60));
-  const zoneSurcharge = Math.max(Number(origin.surcharge || 0), Number(destination.surcharge || 0));
+  const zoneSurcharge = Math.max(
+    Number(origin.surcharge || 0),
+    Number(destination.surcharge || 0)
+  );
   const rawFare = tariffs.baseFare + distanceKm * tariffs.pricePerKm + zoneSurcharge;
   const roundedFare = Math.round(rawFare / 100) * 100;
   const estimatedFare = Math.max(tariffs.minFare, roundedFare);
@@ -555,7 +788,29 @@ async function getRuntimeConfig() {
   }
 }
 
-// Enviar mensaje bilateral de seguimiento para confirmar si el viaje continúa o terminó
+function buildPickupSummary(bState: any): string {
+  const parts: string[] = [];
+  if (bState.unitName) {
+    parts.push(
+      bState.zoneLabel && bState.zoneLabel !== bState.unitName
+        ? `${bState.unitName} (${bState.zoneLabel})`
+        : bState.unitName
+    );
+  } else if (bState.zoneLabel) {
+    parts.push(bState.zoneLabel);
+  } else {
+    parts.push('Ubicación GPS confirmada');
+  }
+
+  if (bState.aptNumber) {
+    parts.push(bState.aptNumber);
+  }
+  if (bState.entryPolicy) {
+    parts.push(bState.entryPolicy);
+  }
+  return parts.join(' • ');
+}
+
 async function sendTripProgressCheckIn(tripId: number, reasonLabel?: string) {
   const tripRes = await db.query(
     `SELECT
@@ -640,7 +895,6 @@ async function sendTripProgressCheckIn(tripId: number, reasonLabel?: string) {
   );
 }
 
-// Finalizar viaje (por FIN del taxista o confirmación "2" de cualquiera de los dos) y disparar calificación + comentario bilateral
 async function completeTripAndPromptRatings(
   tripId: number,
   closedByRole: 'DRIVER' | 'PASSENGER'
@@ -683,7 +937,6 @@ async function completeTripAndPromptRatings(
   }
   await redis.del(...keysToClear);
 
-  // Configurar encuesta bilateral: Usuario califica al Taxista, y Taxista califica al Usuario
   if (drv) {
     await redis.set(
       `rate:${trip.passenger_phone}`,
@@ -751,7 +1004,6 @@ async function completeTripAndPromptRatings(
   }
 }
 
-// Supervisor periódico cada 60s: revisa viajes ACTIVE cuyo tiempo estimado ya se cumplió
 setInterval(async () => {
   try {
     const dueTrips = await db.query(`
@@ -828,6 +1080,8 @@ async function broadcastTripOffer(
       ? `\n🏁 *Destino (B):* ${tripInfo.dropoffAddress}` +
         `\n🛣️ *Recorrido aprox.:* ${tripInfo.distanceKm} km` +
         `\n💵 *Valor aproximado servicio:* *${formatCOP(tripInfo.estimatedFare)}*`
+      : tripInfo.dropoffAddress
+      ? `\n🏁 *Destino (B):* ${tripInfo.dropoffAddress}`
       : `\n🏁 *Destino (B):* Por confirmar con el usuario`;
 
   for (const drv of drivers) {
@@ -852,6 +1106,7 @@ async function broadcastTripOffer(
 function scheduleExpandedSearch(
   tripInfo: {
     id: number;
+    pickupAddress?: string | null;
     dropoffAddress?: string | null;
     distanceKm?: number | null;
     estimatedFare?: number | null;
@@ -1029,19 +1284,22 @@ async function dispatchTripFromPickup(params: {
   }
 
   const greetingPrefix = passengerName
-    ? `🚖 *CENTRAL TAXI CALDAS:*\n🔎 ¡Listo *${passengerName}*! Solicitud *#${tripId}* creada.`
-    : `🚖 *CENTRAL TAXI CALDAS:*\n🔎 Solicitud *#${tripId}* creada.`;
+    ? `🚖 *CENTRAL TAXI CALDAS:*\n🔎 ¡Listo *${passengerName}*! Solicitud *#${tripId}* confirmada.`
+    : `🚖 *CENTRAL TAXI CALDAS:*\n🔎 Solicitud *#${tripId}* confirmada.`;
 
+  const pickupLine = `\n📍 *Recogida (A):* ${pickup.label}`;
   const fareLine =
     dropoff && estimatedFare
       ? `\n🏁 *Destino (B):* ${dropoff.label}\n💵 *Valor aproximado:* *${formatCOP(estimatedFare)}* (${distanceKm} km)`
+      : dropoff
+      ? `\n🏁 *Destino (B):* ${dropoff.label}`
       : '';
 
   await sendText(
     passengerPhone,
     usedExpandedImmediately
-      ? `${greetingPrefix}${fareLine}\n\nEstamos alertando a *${nearbyDrivers.length} conductores* en un radio de *5 km*...\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
-      : `${greetingPrefix}${fareLine}\n\nEstamos alertando a *${nearbyDrivers.length} conductores* cercanos a tu zona...\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
+      ? `${greetingPrefix}${pickupLine}${fareLine}\n\nEstamos alertando a *${nearbyDrivers.length} conductores* en un radio de *5 km*...\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
+      : `${greetingPrefix}${pickupLine}${fareLine}\n\nEstamos alertando a *${nearbyDrivers.length} conductores* cercanos a tu zona...\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
   );
 
   const tripInfo = {
@@ -1084,13 +1342,15 @@ app.get('/admin/zones', async (_req, res) => {
         zone_type,
         aliases,
         surcharge,
+        parent_zone,
+        entry_note,
         ST_Y(location::geometry) AS lat,
         ST_X(location::geometry) AS lng,
         created_at,
         updated_at
       FROM caldas_zones
       ORDER BY
-        CASE zone_type WHEN 'BARRIO' THEN 0 WHEN 'VEREDA' THEN 1 ELSE 2 END,
+        CASE zone_type WHEN 'PUNTO_INTERES' THEN 0 WHEN 'BARRIO' THEN 1 ELSE 2 END,
         name ASC
     `);
     res.json({ zones: result.rows });
@@ -1102,7 +1362,8 @@ app.get('/admin/zones', async (_req, res) => {
 
 app.post('/admin/zones', async (req, res) => {
   try {
-    const { name, zoneType, aliases, surcharge, lat, lng } = req.body;
+    const { name, zoneType, aliases, surcharge, parentZone, entryNote, lat, lng } =
+      req.body;
     const cleanName = String(name || '').trim();
     const numLat = Number(lat);
     const numLng = Number(lng);
@@ -1112,22 +1373,35 @@ app.post('/admin/zones', async (req, res) => {
       : 'BARRIO';
 
     if (cleanName.length < 2 || isNaN(numLat) || isNaN(numLng)) {
-      res.status(400).json({ error: 'Nombre y coordenadas válidas en el mapa son obligatorios.' });
+      res
+        .status(400)
+        .json({ error: 'Nombre y coordenadas válidas en el mapa son obligatorios.' });
       return;
     }
 
     const inserted = await db.query(
-      `INSERT INTO caldas_zones (name, zone_type, aliases, surcharge, location)
-       VALUES ($1, $2, $3, $4, ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography)
-       RETURNING id, name, zone_type, aliases, surcharge,
+      `INSERT INTO caldas_zones (name, zone_type, aliases, surcharge, parent_zone, entry_note, location)
+       VALUES ($1, $2, $3, $4, $5, $6, ST_SetSRID(ST_MakePoint($7, $8), 4326)::geography)
+       RETURNING id, name, zone_type, aliases, surcharge, parent_zone, entry_note,
                  ST_Y(location::geometry) AS lat, ST_X(location::geometry) AS lng`,
-      [cleanName, validType, String(aliases || '').trim(), numSurcharge, numLng, numLat]
+      [
+        cleanName,
+        validType,
+        String(aliases || '').trim(),
+        numSurcharge,
+        String(parentZone || '').trim(),
+        String(entryNote || '').trim(),
+        numLng,
+        numLat,
+      ]
     );
 
     res.json({ ok: true, zone: inserted.rows[0] });
   } catch (err: any) {
     if (err?.code === '23505') {
-      res.status(409).json({ error: 'Ya existe un barrio o vereda con ese nombre.' });
+      res
+        .status(409)
+        .json({ error: 'Ya existe un barrio, vereda o unidad con ese nombre.' });
       return;
     }
     console.error('Error en POST /admin/zones:', err);
@@ -1138,7 +1412,8 @@ app.post('/admin/zones', async (req, res) => {
 app.put('/admin/zones/:id', async (req, res) => {
   try {
     const zoneId = Number(req.params.id);
-    const { name, zoneType, aliases, surcharge, lat, lng } = req.body;
+    const { name, zoneType, aliases, surcharge, parentZone, entryNote, lat, lng } =
+      req.body;
     const cleanName = String(name || '').trim();
     const numLat = Number(lat);
     const numLng = Number(lng);
@@ -1158,12 +1433,24 @@ app.put('/admin/zones/:id', async (req, res) => {
            zone_type = $2,
            aliases = $3,
            surcharge = $4,
-           location = ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography,
+           parent_zone = $5,
+           entry_note = $6,
+           location = ST_SetSRID(ST_MakePoint($7, $8), 4326)::geography,
            updated_at = NOW()
-       WHERE id = $7
-       RETURNING id, name, zone_type, aliases, surcharge,
+       WHERE id = $9
+       RETURNING id, name, zone_type, aliases, surcharge, parent_zone, entry_note,
                  ST_Y(location::geometry) AS lat, ST_X(location::geometry) AS lng`,
-      [cleanName, validType, String(aliases || '').trim(), numSurcharge, numLng, numLat, zoneId]
+      [
+        cleanName,
+        validType,
+        String(aliases || '').trim(),
+        numSurcharge,
+        String(parentZone || '').trim(),
+        String(entryNote || '').trim(),
+        numLng,
+        numLat,
+        zoneId,
+      ]
     );
 
     if (updated.rows.length === 0) {
@@ -1174,7 +1461,9 @@ app.put('/admin/zones/:id', async (req, res) => {
     res.json({ ok: true, zone: updated.rows[0] });
   } catch (err: any) {
     if (err?.code === '23505') {
-      res.status(409).json({ error: 'Ya existe otro barrio o vereda con ese nombre.' });
+      res
+        .status(409)
+        .json({ error: 'Ya existe otro barrio, vereda o unidad con ese nombre.' });
       return;
     }
     console.error('Error en PUT /admin/zones/:id:', err);
@@ -1271,7 +1560,7 @@ app.post('/admin/delete-profile', async (req, res) => {
         `driver_passenger_mode:${drv.phone}`,
         `role_confirm:${drv.phone}`,
         `quote:${drv.phone}`,
-        `pending_pickup:${drv.phone}`
+        `booking:${drv.phone}`
       );
 
       for (const fileRel of [drv.profile_photo_path, drv.doc_photo_path]) {
@@ -1314,7 +1603,7 @@ app.post('/admin/delete-profile', async (req, res) => {
       `trip_checkin:${pass.phone}`,
       `role_confirm:${pass.phone}`,
       `quote:${pass.phone}`,
-      `pending_pickup:${pass.phone}`
+      `booking:${pass.phone}`
     );
     await db.query(`DELETE FROM passengers WHERE id = $1`, [numericId]);
 
@@ -1531,7 +1820,10 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           `SELECT id, full_name, plate, vehicle_model, phone FROM drivers WHERE approval_status = 'PENDING' ORDER BY created_at ASC`
         );
         if (pending.rows.length === 0) {
-          await sendText(from, '🚖 *CENTRAL TAXI CALDAS:*\n✅ No hay conductores pendientes por aprobar.');
+          await sendText(
+            from,
+            '🚖 *CENTRAL TAXI CALDAS:*\n✅ No hay conductores pendientes por aprobar.'
+          );
           return;
         }
         const list = pending.rows
@@ -1642,26 +1934,27 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
     if (activeSessionRaw) {
       const session = JSON.parse(activeSessionRaw);
 
-      // Revisar si responde a una encuesta de seguimiento ("1" continúa / "2" ya terminó)
       const checkinRaw = await redis.get(`trip_checkin:${from}`);
       if (checkinRaw) {
         const checkin = JSON.parse(checkinRaw);
 
         if (
           normalizedCmd === '1' ||
-          normalizedCmd === 'CONTINUA' ||
-          normalizedCmd === 'AUN CONTINUA' ||
-          normalizedCmd === 'EN CURSO' ||
-          normalizedCmd === 'SEGUIMOS'
+          matchesFuzzyVocabulary(text, [
+            'CONTINUA',
+            'AUN CONTINUA',
+            'EN CURSO',
+            'SEGUIMOS',
+            'TODAVIA',
+          ])
         ) {
           await redis.del(
             `trip_checkin:${checkin.passengerPhone}`,
             `trip_checkin:${checkin.driverPhone}`
           );
-          await db.query(
-            `UPDATE trips SET last_followup_at = NOW() WHERE id = $1`,
-            [checkin.tripId]
-          );
+          await db.query(`UPDATE trips SET last_followup_at = NOW() WHERE id = $1`, [
+            checkin.tripId,
+          ]);
           await sendText(
             from,
             `🚖 *CENTRAL TAXI CALDAS:*\n👍 ¡Gracias por confirmar! El viaje *#${checkin.tripId}* sigue activo. Te consultaremos nuevamente en *10 minutos* (o cuando el taxista escriba *FIN*).`
@@ -1671,11 +1964,14 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
         if (
           normalizedCmd === '2' ||
-          normalizedCmd === 'TERMINO' ||
-          normalizedCmd === 'YA TERMINO' ||
-          normalizedCmd === 'FINALIZADO' ||
-          normalizedCmd === 'FINALIZO' ||
-          normalizedCmd === 'FIN'
+          matchesFuzzyVocabulary(text, [
+            'TERMINO',
+            'YA TERMINO',
+            'FINALIZADO',
+            'FINALIZO',
+            'FIN',
+            'LLEGAMOS',
+          ])
         ) {
           await completeTripAndPromptRatings(checkin.tripId, session.role);
           return;
@@ -1777,7 +2073,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         return;
       }
 
-      if (upperText === 'CANCELAR') {
+      if (normalizedCmd === 'CANCELAR') {
         await redis.del(
           `session:${from}`,
           `session:${session.peerPhone}`,
@@ -1935,7 +2231,6 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           ]
         );
 
-        // Verificar si esta ubicación está a <= 250m del destino B (pasados al menos 2 min del inicio)
         const destCheck = await db.query(
           `SELECT id,
                   ST_Y(dropoff_location::geometry) AS drop_lat,
@@ -1971,7 +2266,6 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
     if (rateRaw) {
       const rateState = JSON.parse(rateRaw);
 
-      // Si envía ubicación o un comando operativo nuevo, liberamos la encuesta para no bloquearlo
       if (
         location ||
         /^(HOLA|TAXI|NECESITO|SERVICIO|PIDO|COTIZAR|ACTIVO|SALDO|PAUSA|PEDIR TAXI|MODO CONDUCTOR)$/i.test(
@@ -2022,7 +2316,6 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           return;
         }
       } else {
-        // step === 'RATING'
         if (normalizedCmd === 'OMITIR') {
           await redis.del(`rate:${from}`);
           await sendText(
@@ -2077,7 +2370,6 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
               }
             }
           } else {
-            // Taxista calificando al Usuario
             await db.query(
               `UPDATE trips
                SET driver_rating = $1,
@@ -2130,7 +2422,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       }
     }
 
-    // 2. FLUJO DE CONDUCTOR YA REGISTRADO (CON OPCIÓN DE PEDIR TAXI COMO PASAJERO)
+    // 2. FLUJO DE CONDUCTOR YA REGISTRADO (CON OPCIÓN DE PEDIR TAXI COMO USUARIO)
     const driverRes = await db.query(`SELECT * FROM drivers WHERE phone = $1`, [
       from,
     ]);
@@ -2150,7 +2442,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         await redis.del(
           `driver_passenger_mode:${from}`,
           `quote:${from}`,
-          `pending_pickup:${from}`
+          `booking:${from}`
         );
         await sendText(
           from,
@@ -2166,7 +2458,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         await redis.set(`driver_passenger_mode:${from}`, '1', 'EX', 7200);
         await sendText(
           from,
-          `🚖 *CENTRAL TAXI CALDAS:*\n🙋 *Modo Usuario activado, ${driver.full_name}.* Tu turno como taxista quedó en pausa.\n\n📍 Envíame tu *ubicación GPS* (📎 -> Ubicación) para pedir un taxi, o escribe *COTIZAR* para calcular un viaje de un punto A a un punto B.\n_(Cuando termines, escribe *MODO CONDUCTOR* para volver a operar)_`
+          `🚖 *CENTRAL TAXI CALDAS:*\n🙋 *Modo Usuario activado, ${driver.full_name}.* Tu turno como taxista quedó en pausa.\n\n📍 Envíame tu *ubicación GPS* (📎 -> Ubicación) para confirmar tu punto de recogida y pedir un taxi.\n_(Cuando termines, escribe *MODO CONDUCTOR* para volver a operar)_`
         );
         return;
       }
@@ -2175,8 +2467,13 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         `SELECT id FROM trips WHERE passenger_phone = $1 AND status IN ('SEARCHING', 'ACTIVE') LIMIT 1`,
         [from]
       );
+      const activeBookingFlow = await redis.get(`booking:${from}`);
 
-      if (!isDriverInPassengerMode && activePassengerTrip.rows.length === 0) {
+      if (
+        !isDriverInPassengerMode &&
+        activePassengerTrip.rows.length === 0 &&
+        !activeBookingFlow
+      ) {
         if (!driver.is_verified || driver.approval_status !== 'APPROVED') {
           await sendText(
             from,
@@ -2375,7 +2672,6 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           const completedTrips = completedRes.rows[0]?.total || 0;
           const eta = calculateEtaEstimate(distanceMeters);
 
-          // Ajustar duración esperada incluyendo tiempo de llegada al punto A
           const totalExpectedMins =
             eta.minMins + Number(trip.duration_minutes || 12);
           await db.query(
@@ -2407,15 +2703,22 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
             7200
           );
 
+          const pickupLineForPassenger = trip.pickup_address
+            ? `\n📍 *Recogida (A):* ${trip.pickup_address}`
+            : '';
+
           const quoteInfoForPassenger =
             trip.dropoff_address && trip.estimated_fare
               ? `\n🏁 *Destino (B):* ${trip.dropoff_address}\n💵 *Valor aproximado del servicio:* *${formatCOP(trip.estimated_fare)}* (${trip.distance_km} km)\n`
+              : trip.dropoff_address
+              ? `\n🏁 *Destino (B):* ${trip.dropoff_address}\n`
               : '\n';
 
           const passengerCardText =
             `🚖 *CENTRAL TAXI CALDAS • TAXI ASIGNADO*\n\n` +
             `✅ *¡Tu taxi va en camino${passengerName ? `, ${passengerName}` : ''}!*\n` +
             `⏱️ *Tiempo estimado de llegada:* *${eta.rangeText}* (${eta.distanceText})` +
+            `${pickupLineForPassenger}` +
             `${quoteInfoForPassenger}\n` +
             `👨‍✈️ *Perfil del Taxista:*\n` +
             `• *Nombre:* ${driver.full_name}\n` +
@@ -2452,15 +2755,22 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
             await sendText(trip.passenger_phone, passengerCardText);
           }
 
+          const pickupDetailForDriver = trip.pickup_address
+            ? `\n📍 *Punto A (Recogida):* *${trip.pickup_address}*`
+            : '';
+
           const quoteInfoForDriver =
             trip.dropoff_address && trip.estimated_fare
               ? `\n🏁 *Destino (B):* ${trip.dropoff_address}\n💵 *Valor aproximado servicio:* *${formatCOP(trip.estimated_fare)}* (${trip.distance_km} km)`
+              : trip.dropoff_address
+              ? `\n🏁 *Destino (B):* ${trip.dropoff_address}`
               : `\n🏁 *Destino (B):* Por confirmar con el usuario`;
 
           await sendText(
             from,
             `🚖 *CENTRAL TAXI CALDAS • SERVICIO ASIGNADO*\n\n` +
-              `👤 *Usuario:* ${passengerName || 'Cliente Taxi Caldas'} (${passengerRating} ⭐)\n` +
+              `👤 *Usuario:* ${passengerName || 'Cliente Taxi Caldas'} (${passengerRating} ⭐)` +
+              `${pickupDetailForDriver}\n` +
               `⏱️ *Tiempo estimado al punto A:* ${eta.rangeText}` +
               `${quoteInfoForDriver}\n` +
               `💸 *Comisión descontada:* -${formatCOP(tripCommission)}\n` +
@@ -2470,7 +2780,12 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
               `• *CANCELAR* - Cancelar servicio\n` +
               `• *SOS* - Emergencia`
           );
-          await sendLocation(from, trip.lat, trip.lng, 'Punto A: Recogida del Usuario');
+          await sendLocation(
+            from,
+            trip.lat,
+            trip.lng,
+            trip.pickup_address || 'Punto A: Recogida del Usuario'
+          );
           return;
         }
 
@@ -2485,7 +2800,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
     // 3. CONFIRMACIÓN DE ROL (USUARIO VS TAXISTA) Y AUTO-REGISTRO DE NUEVO TAXISTA
     const regRaw = await redis.get(`reg:${from}`);
 
-    if (upperText === 'CANCELAR' && regRaw) {
+    if (normalizedCmd === 'CANCELAR' && regRaw) {
       await redis.del(`reg:${from}`);
       await sendText(
         from,
@@ -2496,7 +2811,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
     const pendingRoleConfirm = await redis.get(`role_confirm:${from}`);
     if (pendingRoleConfirm && !regRaw) {
-      if (upperText === 'CANCELAR') {
+      if (normalizedCmd === 'CANCELAR') {
         await redis.del(`role_confirm:${from}`);
         await sendText(
           from,
@@ -2506,14 +2821,20 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       }
 
       if (
-        upperText === '2' ||
-        upperText === 'TAXISTA' ||
-        upperText === 'CONDUCTOR' ||
-        upperText === 'SOY TAXISTA' ||
-        upperText === 'SOY TAXI' ||
-        upperText === 'SOY CONDUCTOR'
+        normalizedCmd === '2' ||
+        matchesFuzzyVocabulary(text, [
+          'TAXISTA',
+          'CONDUCTOR',
+          'SOY TAXISTA',
+          'SOY TAXI',
+          'SOY CONDUCTOR',
+        ])
       ) {
-        await redis.del(`role_confirm:${from}`, `consent_pending:${from}`, `ask_name:${from}`);
+        await redis.del(
+          `role_confirm:${from}`,
+          `consent_pending:${from}`,
+          `ask_name:${from}`
+        );
         await redis.set(
           `reg:${from}`,
           JSON.stringify({ step: 'ASK_CONSENT' }),
@@ -2531,11 +2852,13 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       }
 
       if (
-        upperText === '1' ||
-        upperText === 'PASAJERO' ||
-        upperText === 'USUARIO' ||
-        upperText === 'PEDIR' ||
-        upperText === 'PEDIR TAXI' ||
+        normalizedCmd === '1' ||
+        matchesFuzzyVocabulary(text, [
+          'PASAJERO',
+          'USUARIO',
+          'PEDIR',
+          'PEDIR TAXI',
+        ]) ||
         Boolean(location)
       ) {
         await redis.del(`role_confirm:${from}`);
@@ -2768,7 +3091,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           `consent_pending:${from}`,
           `ask_name:${from}`,
           `quote:${from}`,
-          `pending_pickup:${from}`
+          `booking:${from}`
         );
         await sendText(
           from,
@@ -2781,7 +3104,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         const pendingConsent = await redis.get(`consent_pending:${from}`);
 
         if (pendingConsent) {
-          if (upperText === '2') {
+          if (normalizedCmd === '2') {
             await redis.del(`consent_pending:${from}`);
             await redis.set(
               `reg:${from}`,
@@ -2863,8 +3186,8 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
     const passengerName: string | null = passenger?.full_name || null;
 
-    if (upperText === 'CANCELAR') {
-      await redis.del(`ask_name:${from}`, `quote:${from}`, `pending_pickup:${from}`);
+    if (normalizedCmd === 'CANCELAR') {
+      await redis.del(`ask_name:${from}`, `quote:${from}`, `booking:${from}`);
       const searchingTrip = await db.query(
         `UPDATE trips
          SET status = 'CANCELLED', cancelled_by = 'PASSENGER', cancelled_at = NOW()
@@ -2948,12 +3271,550 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       return;
     }
 
-    // 5. FLUJO DE COTIZACIÓN DE PUNTO A A PUNTO B (Y PEDIDO DIRECTO)
+    // 5. FLUJO INTERACTIVO PASO A PASO AL COMPARTIR UBICACIÓN GPS:
+    //    Confirmar Barrio/Unidad -> ¿Es unidad/edificio? -> Nombre unidad (se guarda en DB)
+    //    -> Apto/Casa -> Portería vs Ingreso -> ¿Desea poner destino? -> Buscar taxis
+    const bookingRaw = await redis.get(`booking:${from}`);
+
+    // Si envía un nuevo pin GPS mientras NO está en el paso de elegir destino, reinicia confirmación con el nuevo pin
+    if (
+      location &&
+      (!bookingRaw ||
+        !['ASK_DESTINATION_CHOICE', 'CONFIRM_DESTINATION_DB'].includes(
+          JSON.parse(bookingRaw).step
+        ))
+    ) {
+      await redis.del(`ask_name:${from}`, `quote:${from}`);
+      const lat = location.degreesLatitude;
+      const lng = location.degreesLongitude;
+      const { options, nearestBarrio } = await findPickupCandidates(lat, lng);
+
+      const bState: any = {
+        step: 'CONFIRM_PICKUP_ZONE',
+        lat,
+        lng,
+        options,
+        nearestBarrioLabel: nearestBarrio?.label || '',
+        surcharge: nearestBarrio?.surcharge || 0,
+        zoneLabel: '',
+        unitName: '',
+        aptNumber: '',
+        entryPolicy: '',
+        dropoff: null,
+        distanceKm: null,
+        durationMinutes: null,
+        estimatedFare: null,
+      };
+
+      await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+
+      if (options.length > 0) {
+        const lines = options.map((opt, idx) => {
+          const tag =
+            opt.zoneType === 'PUNTO_INTERES'
+              ? ' _(Unidad / Punto de referencia)_'
+              : '';
+          return `*${idx + 1}* 👉 *${opt.label}*${tag}`;
+        });
+        const otherNum = options.length + 1;
+        lines.push(`*${otherNum}* 👉 *Otro lugar* (escribir nombre de unidad o barrio)`);
+
+        await sendText(
+          from,
+          `🚖 *CENTRAL TAXI CALDAS • CONFIRMAR PUNTO DE PARTIDA*\n\n` +
+            `📍 Ubicación GPS recibida${passengerName ? `, *${passengerName}*` : ''}. ¿En cuál de estos lugares te encuentras?\n\n` +
+            `${lines.join('\n')}\n\n` +
+            `Responde con el *número* (o *SÍ* para confirmar *${options[0].label}*).`
+        );
+      } else {
+        bState.step = 'ASK_CUSTOM_PICKUP_NAME';
+        await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+        await sendText(
+          from,
+          `🚖 *CENTRAL TAXI CALDAS • CONFIRMAR PUNTO DE PARTIDA*\n\n` +
+            `📍 Ubicación GPS recibida${passengerName ? `, *${passengerName}*` : ''}.\n` +
+            `Para que el taxista llegue exacto, escribe el *nombre del barrio, unidad residencial o referencia* donde estás:`
+        );
+      }
+      return;
+    }
+
+    if (bookingRaw) {
+      const bState = JSON.parse(bookingRaw);
+
+      // Helper para pasar al paso de preguntar si desea colocar destino
+      const promptDestinationStep = async () => {
+        bState.step = 'ASK_DESTINATION_CHOICE';
+        await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+        const pickupSummary = buildPickupSummary(bState);
+        await sendText(
+          from,
+          `🚖 *CENTRAL TAXI CALDAS • DESTINO DEL VIAJE*\n\n` +
+            `✅ *Recogida confirmada:* ${pickupSummary}\n\n` +
+            `¿Deseas indicar *hacia dónde vas* para calcular el valor aproximado?\n` +
+            `• Escribe el *barrio, lugar o dirección de destino* (ej: _Mayorca_, _Parque de Caldas_, _Cra 50 # 129-20_)\n` +
+            `• O responde *NO* / *OMITIR* para solicitar el taxi directamente sin destino.`
+        );
+      };
+
+      // PASO 1: Confirmar opción de barrio / unidad detectada
+      if (bState.step === 'CONFIRM_PICKUP_ZONE') {
+        const opts: GeoPoint[] = bState.options || [];
+        const otherNum = opts.length + 1;
+        const numChoice = Number(normalizedCmd);
+
+        let chosen: GeoPoint | null = null;
+
+        if (
+          opts.length > 0 &&
+          (numChoice === 1 || isFuzzyYes(text))
+        ) {
+          chosen = opts[0];
+        } else if (numChoice >= 2 && numChoice <= opts.length) {
+          chosen = opts[numChoice - 1];
+        } else if (
+          numChoice === otherNum ||
+          matchesFuzzyVocabulary(text, ['OTRO', 'OTRA', 'NINGUNO', 'NINGUNA', 'NO'])
+        ) {
+          bState.step = 'ASK_CUSTOM_PICKUP_NAME';
+          await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+          await sendText(
+            from,
+            '🚖 *CENTRAL TAXI CALDAS:*\n✍️ Escribe el *nombre exacto de la unidad residencial, edificio o barrio* donde te encuentras (ej: _Unidad Camino Real_):'
+          );
+          return;
+        } else if (text) {
+          // Verificar si escribió el nombre de alguna de las opciones o un lugar de nuestra base
+          const matchedOpt = opts.find(
+            (o) => fuzzySimilarity(text, o.label) >= 0.72
+          );
+          if (matchedOpt) {
+            chosen = matchedOpt;
+          } else {
+            const dbPlace = await resolvePlaceToCoords(text, false);
+            if (dbPlace) {
+              chosen = dbPlace;
+            } else {
+              // El usuario escribió directamente el nombre de su unidad/lugar (ej: "Unidad Camino Real")
+              const cleanUnit = formatProperName(text);
+              bState.unitName = cleanUnit;
+              bState.zoneLabel = bState.nearestBarrioLabel || cleanUnit;
+              await saveUserDiscoveredLandmark({
+                name: cleanUnit,
+                lat: bState.lat,
+                lng: bState.lng,
+                parentZone: bState.nearestBarrioLabel || '',
+                surcharge: bState.surcharge || 0,
+              });
+              bState.step = 'ASK_APT_NUMBER';
+              await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+              await sendText(
+                from,
+                `🚖 *CENTRAL TAXI CALDAS:*\n✅ Guardamos *${cleanUnit}* en nuestra base de puntos para futuras recogidas.\n\n` +
+                  `🏢 ¿Cuál es el *número de apartamento, torre o casa*? _(Ej: Apto 302 Torre 1, o escribe *OMITIR*)_`
+              );
+              return;
+            }
+          }
+        }
+
+        if (!chosen) {
+          await sendText(
+            from,
+            `🚖 *CENTRAL TAXI CALDAS:*\nPor favor responde con el *número* de tu ubicación (del *1* al *${otherNum}*) o escribe el nombre del lugar donde estás.`
+          );
+          return;
+        }
+
+        bState.surcharge = Math.max(
+          Number(bState.surcharge || 0),
+          Number(chosen.surcharge || 0)
+        );
+
+        // Si ya eligió una Unidad / Punto de Interés guardado en DB, preguntamos directo Apto/Casa
+        if (chosen.zoneType === 'PUNTO_INTERES') {
+          bState.unitName = chosen.label;
+          bState.zoneLabel = chosen.parentZone || bState.nearestBarrioLabel || '';
+          bState.step = 'ASK_APT_NUMBER';
+          await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+          await sendText(
+            from,
+            `🚖 *CENTRAL TAXI CALDAS:*\n✅ Ubicación confirmada: *${chosen.label}*.\n\n` +
+              `🏢 ¿Cuál es el *número de apartamento, torre o casa*? _(Ej: Apto 302 Torre 1, o escribe *OMITIR*)_`
+          );
+          return;
+        }
+
+        // Si eligió un Barrio/Vereda general, preguntamos si está en unidad residencial o edificio
+        bState.zoneLabel = chosen.label;
+        bState.step = 'ASK_IS_COMPLEX';
+        await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+        await sendText(
+          from,
+          `🚖 *CENTRAL TAXI CALDAS:*\n✅ Sector confirmado: *${chosen.label}*.\n\n` +
+            `🏢 ¿Te encuentras dentro de una *unidad residencial, edificio o conjunto*?\n` +
+            `*1* 👉 *SÍ* (unidad / edificio)\n` +
+            `*2* 👉 *NO* (casa sobre vía / esquina / local)`
+        );
+        return;
+      }
+
+      // PASO 1B: Usuario eligió "Otro lugar" y escribe el nombre del barrio o unidad
+      if (bState.step === 'ASK_CUSTOM_PICKUP_NAME') {
+        if (!text || text.length < 2) {
+          await sendText(
+            from,
+            '🚖 *CENTRAL TAXI CALDAS:*\n✍️ Por favor escribe el nombre del *barrio, unidad o referencia* donde te encuentras:'
+          );
+          return;
+        }
+
+        const existingDb = await resolvePlaceToCoords(text, false);
+        if (existingDb) {
+          if (existingDb.zoneType === 'PUNTO_INTERES') {
+            bState.unitName = existingDb.label;
+            bState.zoneLabel =
+              existingDb.parentZone || bState.nearestBarrioLabel || '';
+            bState.step = 'ASK_APT_NUMBER';
+            await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+            await sendText(
+              from,
+              `🚖 *CENTRAL TAXI CALDAS:*\n✅ Ubicación confirmada: *${existingDb.label}*.\n\n🏢 ¿Cuál es el *número de apartamento, torre o casa*? _(O escribe *OMITIR*)_`
+            );
+          } else {
+            bState.zoneLabel = existingDb.label;
+            bState.surcharge = Number(existingDb.surcharge || 0);
+            bState.step = 'ASK_IS_COMPLEX';
+            await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+            await sendText(
+              from,
+              `🚖 *CENTRAL TAXI CALDAS:*\n✅ Sector confirmado: *${existingDb.label}*.\n\n🏢 ¿Te encuentras dentro de una *unidad residencial, edificio o conjunto*?\n*1* 👉 *SÍ*\n*2* 👉 *NO*`
+            );
+          }
+          return;
+        }
+
+        // Es una unidad o referencia nueva: la guardamos con su GPS en caldas_zones
+        const cleanPlace = formatProperName(text);
+        bState.unitName = cleanPlace;
+        bState.zoneLabel = bState.nearestBarrioLabel || cleanPlace;
+        await saveUserDiscoveredLandmark({
+          name: cleanPlace,
+          lat: bState.lat,
+          lng: bState.lng,
+          parentZone: bState.nearestBarrioLabel || '',
+          surcharge: bState.surcharge || 0,
+        });
+
+        bState.step = 'ASK_APT_NUMBER';
+        await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+        await sendText(
+          from,
+          `🚖 *CENTRAL TAXI CALDAS:*\n✅ ¡Gracias! Guardamos *${cleanPlace}* en nuestra base territorial.\n\n🏢 ¿Cuál es el *número de apartamento, torre o casa*? _(Ej: Apto 302, o escribe *OMITIR*)_`
+        );
+        return;
+      }
+
+      // PASO 2: ¿Es unidad residencial o edificio?
+      if (bState.step === 'ASK_IS_COMPLEX') {
+        if (normalizedCmd === '1' || isFuzzyYes(text)) {
+          bState.step = 'ASK_COMPLEX_NAME';
+          await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+          await sendText(
+            from,
+            '🚖 *CENTRAL TAXI CALDAS:*\n🏢 ¿Cuál es el *nombre de la unidad residencial o edificio*? _(Ej: Unidad Camino Real)_'
+          );
+          return;
+        }
+
+        if (normalizedCmd === '2' || isFuzzyNoOrSkip(text)) {
+          await promptDestinationStep();
+          return;
+        }
+
+        await sendText(
+          from,
+          '🚖 *CENTRAL TAXI CALDAS:*\nPor favor respóndeme *1* (SÍ es unidad/edificio) o *2* (NO, es vía pública/casa).'
+        );
+        return;
+      }
+
+      // PASO 3: Capturar nombre de la unidad/edificio y guardarlo en PostgreSQL con el pin GPS
+      if (bState.step === 'ASK_COMPLEX_NAME') {
+        if (!text || text.length < 2) {
+          await sendText(
+            from,
+            '🚖 *CENTRAL TAXI CALDAS:*\n✍️ Por favor escribe el *nombre de la unidad o edificio*:'
+          );
+          return;
+        }
+
+        const cleanUnit = formatProperName(text);
+        bState.unitName = cleanUnit;
+        await saveUserDiscoveredLandmark({
+          name: cleanUnit,
+          lat: bState.lat,
+          lng: bState.lng,
+          parentZone: bState.zoneLabel || bState.nearestBarrioLabel || '',
+          surcharge: bState.surcharge || 0,
+        });
+
+        bState.step = 'ASK_APT_NUMBER';
+        await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+        await sendText(
+          from,
+          `🚖 *CENTRAL TAXI CALDAS:*\n✅ Guardamos *${cleanUnit}* en nuestra base de ubicaciones.\n\n` +
+            `🚪 ¿Cuál es el *número de apartamento, torre o casa*? _(Ej: Apto 401 Torre 2, o escribe *OMITIR*)_`
+        );
+        return;
+      }
+
+      // PASO 4: Capturar número de apartamento, torre o casa
+      if (bState.step === 'ASK_APT_NUMBER') {
+        if (text && !isFuzzyNoOrSkip(text)) {
+          bState.aptNumber = text.trim();
+        }
+        bState.step = 'ASK_ENTRY_POLICY';
+        await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+        await sendText(
+          from,
+          `🚖 *CENTRAL TAXI CALDAS:*\n🚧 ¿En portería *dejan ingresar el taxi* o *te espera en portería*?\n\n` +
+            `*1* 👉 Espera en *portería*\n` +
+            `*2* 👉 *Puede ingresar* el vehículo`
+        );
+        return;
+      }
+
+      // PASO 5: Portería vs Ingreso del vehículo
+      if (bState.step === 'ASK_ENTRY_POLICY') {
+        const pref = parseEntryPreference(text);
+        if (!pref) {
+          await sendText(
+            from,
+            '🚖 *CENTRAL TAXI CALDAS:*\nPor favor respóndeme:\n*1* 👉 Espera en *portería*\n*2* 👉 *Puede ingresar* el vehículo'
+          );
+          return;
+        }
+
+        bState.entryPolicy =
+          pref === 'PORTERIA'
+            ? 'Espera en portería'
+            : 'Puede ingresar el vehículo';
+
+        if (bState.unitName) {
+          await saveUserDiscoveredLandmark({
+            name: bState.unitName,
+            lat: bState.lat,
+            lng: bState.lng,
+            parentZone: bState.zoneLabel || bState.nearestBarrioLabel || '',
+            entryNote: bState.entryPolicy,
+            surcharge: bState.surcharge || 0,
+          });
+        }
+
+        await promptDestinationStep();
+        return;
+      }
+
+      // PASO 6: Preguntar si desea colocar destino (barrio o dirección) o solicitar vehículos de una vez
+      if (bState.step === 'ASK_DESTINATION_CHOICE') {
+        const pickupSummary = buildPickupSummary(bState);
+        const pickupGeo: GeoPoint = {
+          lat: bState.lat,
+          lng: bState.lng,
+          label: pickupSummary,
+          surcharge: bState.surcharge || 0,
+        };
+
+        // Si NO quiere poner destino -> pasar directamente a solicitar disponibilidad de vehículos
+        if (isFuzzyNoOrSkip(text) || normalizedCmd === 'DIRECTO') {
+          await redis.del(`booking:${from}`);
+          await dispatchTripFromPickup({
+            passengerPhone: from,
+            passengerName,
+            pickup: pickupGeo,
+            tripCommission,
+          });
+          return;
+        }
+
+        if (location) {
+          const { nearestBarrio } = await findPickupCandidates(
+            location.degreesLatitude,
+            location.degreesLongitude
+          );
+          const destGeo: GeoPoint = {
+            lat: location.degreesLatitude,
+            lng: location.degreesLongitude,
+            label: nearestBarrio
+              ? `${nearestBarrio.label} (GPS)`
+              : 'Ubicación GPS de destino',
+            surcharge: nearestBarrio?.surcharge || 0,
+            fromDb: true,
+          };
+
+          const quote = await calculateRouteQuote(pickupGeo, destGeo, {
+            baseFare,
+            pricePerKm,
+            minFare,
+          });
+
+          bState.dropoff = destGeo;
+          bState.distanceKm = quote.distanceKm;
+          bState.durationMinutes = quote.durationMinutes;
+          bState.estimatedFare = quote.estimatedFare;
+          bState.step = 'CONFIRM_DESTINATION_DB';
+          await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+
+          await sendText(
+            from,
+            `🚖 *CENTRAL TAXI CALDAS • CONFIRMAR DESTINO*\n\n` +
+              `📍 *Recogida (A):* ${pickupSummary}\n` +
+              `🏁 *Destino (B):* *${destGeo.label}*\n` +
+              `🛣️ *Distancia aprox.:* ${quote.distanceKm} km (~${quote.durationMinutes} min)\n` +
+              `💵 *Valor aproximado:* *${formatCOP(quote.estimatedFare)}*\n\n` +
+              `¿Es correcto? Responde *SÍ* (o *1*) para solicitar el taxi ahora, o *NO* para cambiar/omitir destino.`
+          );
+          return;
+        }
+
+        if (text) {
+          // 1. Buscar primero en nuestra base de datos (con tolerancia ortográfica)
+          const dbMatch = await resolvePlaceToCoords(text, false);
+
+          if (dbMatch) {
+            const quote = await calculateRouteQuote(pickupGeo, dbMatch, {
+              baseFare,
+              pricePerKm,
+              minFare,
+            });
+
+            bState.dropoff = dbMatch;
+            bState.distanceKm = quote.distanceKm;
+            bState.durationMinutes = quote.durationMinutes;
+            bState.estimatedFare = quote.estimatedFare;
+            bState.step = 'CONFIRM_DESTINATION_DB';
+            await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+
+            await sendText(
+              from,
+              `🚖 *CENTRAL TAXI CALDAS • CONFIRMAR DESTINO*\n\n` +
+                `Encontré este lugar en nuestra base de datos:\n` +
+                `🏁 *Destino (B):* *${dbMatch.label}*\n` +
+                `🛣️ *Recorrido aprox.:* ${quote.distanceKm} km (~${quote.durationMinutes} min)\n` +
+                `💵 *Valor aproximado:* *${formatCOP(quote.estimatedFare)}*\n\n` +
+                `¿Es correcto? Responde *SÍ* (o *1*) para confirmar y buscar tu taxi, o escribe otro destino.`
+            );
+            return;
+          }
+
+          // 2. Si NO está en nuestra base de datos, intentar geocodificación abierta o aceptar la dirección escrita sin bloquear
+          const openGeo = await resolvePlaceToCoords(text, true);
+          if (openGeo) {
+            const quote = await calculateRouteQuote(pickupGeo, openGeo, {
+              baseFare,
+              pricePerKm,
+              minFare,
+            });
+            bState.dropoff = {
+              ...openGeo,
+              label: `${formatProperName(text)} (${openGeo.label})`,
+            };
+            bState.distanceKm = quote.distanceKm;
+            bState.durationMinutes = quote.durationMinutes;
+            bState.estimatedFare = quote.estimatedFare;
+            bState.step = 'CONFIRM_DESTINATION_DB';
+            await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+
+            await sendText(
+              from,
+              `🚖 *CENTRAL TAXI CALDAS • CONFIRMAR DESTINO*\n\n` +
+                `🏁 *Destino (B):* *${bState.dropoff.label}*\n` +
+                `🛣️ *Recorrido aprox.:* ${quote.distanceKm} km (~${quote.durationMinutes} min)\n` +
+                `💵 *Valor aproximado:* *${formatCOP(quote.estimatedFare)}*\n\n` +
+                `Responde *SÍ* (o *1*) para solicitar el taxi ahora, o *OMITIR* para pedir sin tarifa estimada.`
+            );
+            return;
+          }
+
+          // Dirección libre no geocodificada: continúa sin problemas
+          bState.dropoff = {
+            lat: null as any,
+            lng: null as any,
+            label: text.trim(),
+            fromDb: false,
+          };
+          bState.distanceKm = null;
+          bState.durationMinutes = 12;
+          bState.estimatedFare = null;
+          bState.step = 'CONFIRM_DESTINATION_DB';
+          await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+
+          await sendText(
+            from,
+            `🚖 *CENTRAL TAXI CALDAS • CONFIRMAR DESTINO*\n\n` +
+              `📍 *Recogida (A):* ${pickupSummary}\n` +
+              `🏁 *Destino (B) anotado:* *${text.trim()}*\n\n` +
+              `Responde *SÍ* (o *1*) para confirmar y solicitar tu taxi de inmediato.`
+          );
+          return;
+        }
+      }
+
+      // PASO 7: Confirmar destino elegido y lanzar búsqueda de taxistas
+      if (bState.step === 'CONFIRM_DESTINATION_DB') {
+        const pickupSummary = buildPickupSummary(bState);
+        const pickupGeo: GeoPoint = {
+          lat: bState.lat,
+          lng: bState.lng,
+          label: pickupSummary,
+          surcharge: bState.surcharge || 0,
+        };
+
+        if (normalizedCmd === '1' || isFuzzyYes(text)) {
+          await redis.del(`booking:${from}`);
+          await dispatchTripFromPickup({
+            passengerPhone: from,
+            passengerName,
+            pickup: pickupGeo,
+            dropoff: bState.dropoff,
+            distanceKm: bState.distanceKm,
+            durationMinutes: bState.durationMinutes,
+            estimatedFare: bState.estimatedFare,
+            tripCommission,
+          });
+          return;
+        }
+
+        if (isFuzzyNoOrSkip(text)) {
+          await redis.del(`booking:${from}`);
+          await dispatchTripFromPickup({
+            passengerPhone: from,
+            passengerName,
+            pickup: pickupGeo,
+            tripCommission,
+          });
+          return;
+        }
+
+        if (text) {
+          // Si escribió un destino distinto en lugar de decir SÍ, lo evaluamos como nuevo destino
+          bState.step = 'ASK_DESTINATION_CHOICE';
+          await redis.set(`booking:${from}`, JSON.stringify(bState), 'EX', 1800);
+          await sendText(
+            from,
+            '🚖 *CENTRAL TAXI CALDAS:*\nEscribe nuevamente el destino que deseas confirmar, o responde *OMITIR* para pedir el taxi de una vez.'
+          );
+          return;
+        }
+      }
+    }
+
+    // 5B. COTIZADOR MANUAL POR TEXTO (CUANDO ESCRIBEN "COTIZAR" SIN HABER ENVIADO GPS ANTES)
     const quoteRaw = await redis.get(`quote:${from}`);
-    const pendingPickupRaw = await redis.get(`pending_pickup:${from}`);
 
     if (isQuoteIntent(upperText)) {
-      await redis.del(`ask_name:${from}`, `pending_pickup:${from}`);
+      await redis.del(`ask_name:${from}`, `booking:${from}`);
       await redis.set(
         `quote:${from}`,
         JSON.stringify({ step: 'ASK_ORIGIN' }),
@@ -2965,7 +3826,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         `🚖 *CENTRAL TAXI CALDAS • COTIZADOR DE SERVICIO*\n\n` +
           `1️⃣ Envía el *Punto A (Origen)*:\n` +
           `• Comparte tu *ubicación GPS* (📎 -> Ubicación)\n` +
-          `• O escribe el *lugar/barrio de salida* (ej: _Parque Principal de Caldas_, _La Variante_)\n\n` +
+          `• O escribe el *barrio, unidad o lugar de salida* (ej: _Barrio La Rivera_, _Unidad Camino Real_, _Parque de Caldas_)\n\n` +
           `_(Escribe *CANCELAR* en cualquier momento para salir)_`
       );
       return;
@@ -2977,21 +3838,26 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       if (qState.step === 'ASK_ORIGIN') {
         let originPoint: GeoPoint | null = null;
         if (location) {
-          const nearA = await findNearestCaldasZone(location.degreesLatitude, location.degreesLongitude);
+          const { nearestBarrio } = await findPickupCandidates(
+            location.degreesLatitude,
+            location.degreesLongitude
+          );
           originPoint = {
             lat: location.degreesLatitude,
             lng: location.degreesLongitude,
-            label: nearA ? `${nearA.label} (GPS)` : 'Ubicación GPS compartida (Origen)',
-            surcharge: nearA?.surcharge || 0,
+            label: nearestBarrio
+              ? `${nearestBarrio.label} (GPS)`
+              : 'Ubicación GPS compartida (Origen)',
+            surcharge: nearestBarrio?.surcharge || 0,
           };
         } else if (text) {
-          originPoint = await resolvePlaceToCoords(text);
+          originPoint = await resolvePlaceToCoords(text, true);
         }
 
         if (!originPoint) {
           await sendText(
             from,
-            '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ No logré ubicar ese punto de salida. Por favor comparte el *pin de ubicación GPS* (📎 -> Ubicación) o escribe un lugar conocido (ej: _Parque de Caldas_, _La Miel_, _Mayorca_).'
+            '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ No logré ubicar ese punto de salida. Por favor comparte el *pin de ubicación GPS* (📎 -> Ubicación) o escribe un lugar conocido (ej: _Barrio La Rivera_, _Parque de Caldas_).'
           );
           return;
         }
@@ -3005,7 +3871,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
             `✅ *Punto A (Origen):* ${originPoint.label}\n\n` +
             `2️⃣ Ahora envía el *Punto B (Destino)*:\n` +
             `• Comparte el *pin GPS del destino* (📎 -> Ubicación)\n` +
-            `• O escribe el *lugar/barrio de destino* (ej: _Centro Comercial Mayorca_, _Estación La Estrella_, _El Poblado_)`
+            `• O escribe el *barrio, unidad o lugar de destino* (ej: _Centro Comercial Mayorca_, _La Miel_)`
         );
         return;
       }
@@ -3013,21 +3879,26 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       if (qState.step === 'ASK_DESTINATION') {
         let destPoint: GeoPoint | null = null;
         if (location) {
-          const nearB = await findNearestCaldasZone(location.degreesLatitude, location.degreesLongitude);
+          const { nearestBarrio } = await findPickupCandidates(
+            location.degreesLatitude,
+            location.degreesLongitude
+          );
           destPoint = {
             lat: location.degreesLatitude,
             lng: location.degreesLongitude,
-            label: nearB ? `${nearB.label} (GPS)` : 'Ubicación GPS de destino',
-            surcharge: nearB?.surcharge || 0,
+            label: nearestBarrio
+              ? `${nearestBarrio.label} (GPS)`
+              : 'Ubicación GPS de destino',
+            surcharge: nearestBarrio?.surcharge || 0,
           };
         } else if (text) {
-          destPoint = await resolvePlaceToCoords(text);
+          destPoint = await resolvePlaceToCoords(text, true);
         }
 
         if (!destPoint) {
           await sendText(
             from,
-            '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ No logré ubicar ese destino. Envía el *pin GPS del destino* (📎 -> Ubicación) o escribe el nombre del lugar/barrio (ej: _Mayorca_, _Envigado_, _Parque de Caldas_).'
+            '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ No logré ubicar ese destino. Envía el *pin GPS del destino* (📎 -> Ubicación) o escribe el nombre del lugar/barrio.'
           );
           return;
         }
@@ -3052,7 +3923,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
             `🏁 *Destino (B):* ${destPoint.label}\n` +
             `🛣️ *Distancia estimada:* ${routeQuote.distanceKm} km (~${routeQuote.durationMinutes} min)\n` +
             `💵 *Valor aproximado del servicio:* *${formatCOP(routeQuote.estimatedFare)}*\n\n` +
-            `👉 Responde *1* o *PEDIR* para solicitar el taxi ahora mismo con este destino y tarifa.\n` +
+            `👉 Responde *1* o *SÍ* para solicitar el taxi ahora mismo con este destino y tarifa.\n` +
             `_(O escribe *COTIZAR* para calcular otra ruta, o *CANCELAR* para salir)_`
         );
         return;
@@ -3060,12 +3931,9 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
       if (qState.step === 'CONFIRM_QUOTE') {
         if (
-          upperText === '1' ||
-          upperText === 'PEDIR' ||
-          upperText === 'SI' ||
-          upperText === 'SÍ' ||
-          upperText === 'CONFIRMAR' ||
-          upperText === 'SOLICITAR'
+          normalizedCmd === '1' ||
+          isFuzzyYes(text) ||
+          matchesFuzzyVocabulary(text, ['PEDIR', 'CONFIRMAR', 'SOLICITAR'])
         ) {
           await redis.del(`quote:${from}`);
           await dispatchTripFromPickup({
@@ -3083,133 +3951,10 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
         await sendText(
           from,
-          `🚖 *CENTRAL TAXI CALDAS:*\n💵 Tu cotización de *${qState.origin.label}* a *${qState.destination.label}* es de *${formatCOP(qState.estimatedFare)}*.\n\nResponde *1* o *PEDIR* para enviar un taxista, *COTIZAR* para cambiar de ruta, o *CANCELAR*.`
+          `🚖 *CENTRAL TAXI CALDAS:*\n💵 Tu cotización de *${qState.origin.label}* a *${qState.destination.label}* es de *${formatCOP(qState.estimatedFare)}*.\n\nResponde *1* o *SÍ* para enviar un taxista, *COTIZAR* para cambiar de ruta, o *CANCELAR*.`
         );
         return;
       }
-    }
-
-    if (pendingPickupRaw) {
-      const pState = JSON.parse(pendingPickupRaw);
-      const pickupPoint: GeoPoint = pState.origin;
-
-      if (
-        upperText === '1' ||
-        upperText === 'DIRECTO' ||
-        upperText === 'PEDIR' ||
-        upperText === 'YA' ||
-        upperText === 'SIN DESTINO'
-      ) {
-        await redis.del(`pending_pickup:${from}`);
-        await dispatchTripFromPickup({
-          passengerPhone: from,
-          passengerName,
-          pickup: pickupPoint,
-          tripCommission,
-        });
-        return;
-      }
-
-      let destPoint: GeoPoint | null = null;
-      if (location) {
-        const nearB2 = await findNearestCaldasZone(location.degreesLatitude, location.degreesLongitude);
-        destPoint = {
-          lat: location.degreesLatitude,
-          lng: location.degreesLongitude,
-          label: nearB2 ? `${nearB2.label} (GPS)` : 'Ubicación GPS de destino',
-          surcharge: nearB2?.surcharge || 0,
-        };
-      } else if (text) {
-        destPoint = await resolvePlaceToCoords(text);
-      }
-
-      if (destPoint) {
-        await redis.del(`pending_pickup:${from}`);
-        const routeQuote = await calculateRouteQuote(pickupPoint, destPoint, {
-          baseFare,
-          pricePerKm,
-          minFare,
-        });
-
-        await redis.set(
-          `quote:${from}`,
-          JSON.stringify({
-            step: 'CONFIRM_QUOTE',
-            origin: pickupPoint,
-            destination: destPoint,
-            distanceKm: routeQuote.distanceKm,
-            durationMinutes: routeQuote.durationMinutes,
-            estimatedFare: routeQuote.estimatedFare,
-          }),
-          'EX',
-          1800
-        );
-
-        await sendText(
-          from,
-          `🚖 *CENTRAL TAXI CALDAS • COTIZACIÓN ESTIMADA*\n\n` +
-            `📍 *Origen (A):* ${pickupPoint.label}\n` +
-            `🏁 *Destino (B):* ${destPoint.label}\n` +
-            `🛣️ *Distancia estimada:* ${routeQuote.distanceKm} km (~${routeQuote.durationMinutes} min)\n` +
-            `💵 *Valor aproximado del servicio:* *${formatCOP(routeQuote.estimatedFare)}*\n\n` +
-            `👉 Responde *1* o *PEDIR* para solicitar el taxi ahora mismo con este valor, o *CANCELAR* para salir.`
-        );
-        return;
-      }
-
-      await sendText(
-        from,
-        '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ No reconocí ese destino. Escribe un lugar/barrio conocido (ej: _Mayorca_, _Parque de Caldas_), envía el pin GPS de destino, o responde *1* para pedir el taxi directo.'
-      );
-      return;
-    }
-
-    if (location) {
-      await redis.del(`ask_name:${from}`);
-      const nearPickup = await findNearestCaldasZone(location.degreesLatitude, location.degreesLongitude);
-      const pickupPoint: GeoPoint = {
-        lat: location.degreesLatitude,
-        lng: location.degreesLongitude,
-        label: nearPickup ? `${nearPickup.label} (GPS)` : 'Ubicación GPS compartida',
-        surcharge: nearPickup?.surcharge || 0,
-      };
-      const token = `${Date.now()}`;
-
-      await redis.set(
-        `pending_pickup:${from}`,
-        JSON.stringify({ origin: pickupPoint, token }),
-        'EX',
-        120
-      );
-
-      await sendText(
-        from,
-        `🚖 *CENTRAL TAXI CALDAS:*\n` +
-          `📍 *Punto A (Recogida):* *${pickupPoint.label}*${passengerName ? ` (${passengerName})` : ''}\n\n` +
-          `¿Deseas conocer el *valor aproximado* antes de pedir?\n` +
-          `• Escribe tu *destino (Punto B)* (ej: _Mayorca_, _Parque de Caldas_) o envía el *pin GPS de destino*\n` +
-          `• O responde *1* / *DIRECTO* para buscar tu taxi de inmediato.`
-      );
-
-      setTimeout(async () => {
-        try {
-          const stillWaitingRaw = await redis.get(`pending_pickup:${from}`);
-          if (!stillWaitingRaw) return;
-          const stillWaiting = JSON.parse(stillWaitingRaw);
-          if (stillWaiting.token !== token) return;
-
-          await redis.del(`pending_pickup:${from}`);
-          await dispatchTripFromPickup({
-            passengerPhone: from,
-            passengerName,
-            pickup: pickupPoint,
-            tripCommission,
-          });
-        } catch (err) {
-          console.error('Error en auto-despacho pendiente:', err);
-        }
-      }, 18_000);
-      return;
     }
 
     // 6. CAPTURA O SALUDO PERSONALIZADO POR NOMBRE PARA USUARIOS CON HABEAS DATA ACEPTADO
@@ -3235,7 +3980,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         await sendText(
           from,
           `🚖 *CENTRAL TAXI CALDAS:*\n🙌 ¡Mucho gusto, *${formattedName}*! Ya quedaste registrado.\n\n` +
-            `• 📍 Envía tu *ubicación actual* (📎 -> Ubicación) para pedir un taxi\n` +
+            `• 📍 Envía tu *ubicación actual* (📎 -> Ubicación) para confirmar tu punto de recogida y pedir un taxi\n` +
             `• 💵 O escribe *COTIZAR* para calcular el valor de un viaje de un punto A a un punto B.`
         );
         return;
@@ -3252,7 +3997,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
     await sendText(
       from,
       `🚖 *CENTRAL TAXI CALDAS:*\n👋 ¡Hola *${passengerName}*! Qué gusto saludarte de nuevo.\n\n` +
-        `• 📍 Envía tu *ubicación actual* (📎 -> Ubicación) para pedir un taxi\n` +
+        `• 📍 Envía tu *ubicación actual* (📎 -> Ubicación) para confirmar tu lugar de recogida y pedir un taxi\n` +
         `• 💵 O escribe *COTIZAR* para saber el valor aproximado de un punto A a un punto B.`
     );
   } catch (err: any) {
