@@ -4,9 +4,19 @@ export async function ensureDatabaseSchema(db: Pool) {
   await db.query(`
     CREATE EXTENSION IF NOT EXISTS postgis;
 
+    CREATE TABLE IF NOT EXISTS passengers (
+      id SERIAL PRIMARY KEY,
+      phone VARCHAR(35) UNIQUE NOT NULL,
+      full_name VARCHAR(100),
+      push_name VARCHAR(100),
+      trips_count INTEGER DEFAULT 0,
+      last_interaction_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS drivers (
       id SERIAL PRIMARY KEY,
-      phone VARCHAR(20) UNIQUE NOT NULL,
+      phone VARCHAR(35) UNIQUE NOT NULL,
       full_name VARCHAR(100) NOT NULL,
       plate VARCHAR(15) UNIQUE NOT NULL,
       vehicle_model VARCHAR(50),
@@ -27,7 +37,7 @@ export async function ensureDatabaseSchema(db: Pool) {
 
     CREATE TABLE IF NOT EXISTS trips (
       id SERIAL PRIMARY KEY,
-      passenger_phone VARCHAR(20) NOT NULL,
+      passenger_phone VARCHAR(35) NOT NULL,
       driver_id INTEGER REFERENCES drivers(id),
       pickup_location GEOGRAPHY(Point, 4326) NOT NULL,
       pickup_address TEXT,
@@ -48,8 +58,8 @@ export async function ensureDatabaseSchema(db: Pool) {
       id SERIAL PRIMARY KEY,
       trip_id INTEGER REFERENCES trips(id),
       sender_role VARCHAR(15) NOT NULL,
-      sender_phone VARCHAR(20) NOT NULL,
-      receiver_phone VARCHAR(20) NOT NULL,
+      sender_phone VARCHAR(35) NOT NULL,
+      receiver_phone VARCHAR(35) NOT NULL,
       message_type VARCHAR(20) DEFAULT 'TEXT',
       content TEXT,
       created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
@@ -69,7 +79,7 @@ export async function ensureDatabaseSchema(db: Pool) {
       id SERIAL PRIMARY KEY,
       trip_id INTEGER REFERENCES trips(id),
       triggered_by VARCHAR(20) NOT NULL,
-      trigger_phone VARCHAR(20) NOT NULL,
+      trigger_phone VARCHAR(35) NOT NULL,
       status VARCHAR(20) DEFAULT 'OPEN',
       resolved_at TIMESTAMP WITH TIME ZONE,
       resolved_by VARCHAR(50),
@@ -88,5 +98,5 @@ export async function ensureDatabaseSchema(db: Pool) {
       ('trip_commission', '500')
     ON CONFLICT (key) DO NOTHING;
   `);
-  console.log('✅ Esquema PostGIS y tablas de Taxi Caldas creadas correctamente');
+  console.log('✅ Esquema PostGIS y tablas (clientes + conductores) listos');
 }

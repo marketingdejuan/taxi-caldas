@@ -1,10 +1,10 @@
-import { ensureDatabaseSchema } from './initDb';
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
 import { Pool } from 'pg';
 import Redis from 'ioredis';
 import dotenv from 'dotenv';
+import { ensureDatabaseSchema } from './initDb';
 import {
   sendText,
   sendLocation,
@@ -34,19 +34,72 @@ function formatCOP(value: number): string {
   return `$${value.toLocaleString('es-CO')}`;
 }
 
+function formatProperName(raw: string): string {
+  return raw
+    .trim()
+    .replace(/\s+/g, ' ')
+    .split(' ')
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(' ');
+}
+
+function isInvalidNameInput(text: string): boolean {
+  const clean = text.trim();
+  if (clean.length < 2 || clean.length > 45) return true;
+  if (/[0-9@/:]/.test(clean)) return true;
+  const blockedWords = [
+    'HOLA',
+    'HOLI',
+    'BUENAS',
+    'BUENOS DIAS',
+    'BUENAS TARDES',
+    'BUENAS NOCHES',
+    'TAXI',
+    'NECESITO',
+    'NECESITO UN TAXI',
+    'SERVICIO',
+    'PIDO',
+    'UBICACION',
+    'CANCELAR',
+    'AYUDA',
+    'INFO',
+    'OK',
+    'SI',
+    'NO',
+  ];
+  return blockedWords.includes(clean.toUpperCase());
+}
+
+async function upsertPassenger(phone: string, pushName?: string | null) {
+  const res = await db.query(
+    `INSERT INTO passengers (phone, push_name, last_interaction_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (phone) DO UPDATE SET
+       push_name = COALESCE(NULLIF(EXCLUDED.push_name, ''), passengers.push_name),
+       last_interaction_at = NOW()
+     RETURNING *`,
+    [phone, pushName || null]
+  );
+  return res.rows[0];
+}
+
 async function getRuntimeConfig() {
   try {
     const res = await db.query(`SELECT key, value FROM app_settings`);
     const map: Record<string, string> = {};
     for (const r of res.rows) map[r.key] = r.value;
 
-    const centralPhone = map.central_phone || process.env.CENTRAL_PHONE || '573133336835';
-    const adminRaw = map.admin_phones || process.env.ADMIN_PHONES || centralPhone;
+    const centralPhone =
+      map.central_phone || process.env.CENTRAL_PHONE || '573133336835';
+    const adminRaw =
+      map.admin_phones || process.env.ADMIN_PHONES || centralPhone;
     const adminPhones = adminRaw
       .split(',')
       .map((p) => p.trim())
       .filter(Boolean);
-    const tripCommission = Number(map.trip_commission || process.env.TRIP_COMMISSION || 500);
+    const tripCommission = Number(
+      map.trip_commission || process.env.TRIP_COMMISSION || 500
+    );
 
     return { centralPhone, adminPhones, tripCommission };
   } catch {
@@ -94,7 +147,9 @@ async function broadcastTripOffer(
     : '🚨 *NUEVO SERVICIO DISPONIBLE*';
 
   for (const drv of drivers) {
-    const currentTrip = await db.query(`SELECT status FROM trips WHERE id = $1`, [tripId]);
+    const currentTrip = await db.query(`SELECT status FROM trips WHERE id = $1`, [
+      tripId,
+    ]);
     if (currentTrip.rows[0]?.status !== 'SEARCHING') break;
 
     await redis.set(`offer:${drv.phone}`, tripId, 'EX', 120);
@@ -109,14 +164,19 @@ async function broadcastTripOffer(
 function scheduleExpandedSearch(
   tripId: number,
   passengerPhone: string,
+  passengerName: string | null,
   lng: number,
   lat: number,
   tripCommission: number,
   initialAlertedIds: number[]
 ) {
+  const nameTag = passengerName ? ` *${passengerName}*` : '';
+
   setTimeout(async () => {
     try {
-      const check = await db.query(`SELECT status FROM trips WHERE id = $1`, [tripId]);
+      const check = await db.query(`SELECT status FROM trips WHERE id = $1`, [
+        tripId,
+      ]);
       if (check.rows[0]?.status !== 'SEARCHING') return;
 
       const extraDrivers = await findAvailableDriversInRadius(
@@ -130,13 +190,13 @@ function scheduleExpandedSearch(
       if (extraDrivers.length > 0) {
         await sendText(
           passengerPhone,
-          `🔎 Seguimos buscando tu taxi. Ampliamos el radio a *5 km* y acabamos de alertar a *${extraDrivers.length} conductores* adicionales...`
+          `🔎 Seguimos buscando tu taxi${nameTag}. Ampliamos el radio a *5 km* y acabamos de alertar a *${extraDrivers.length} conductores* adicionales...`
         );
         await broadcastTripOffer(extraDrivers, tripId, tripCommission, true);
       } else if (initialAlertedIds.length > 0) {
         await sendText(
           passengerPhone,
-          `⏳ Seguimos esperando confirmación de los conductores cercanos a tu zona...\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
+          `⏳ Seguimos esperando confirmación de los conductores cercanos a tu zona${nameTag}...\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
         );
       }
     } catch (err) {
@@ -156,7 +216,7 @@ function scheduleExpandedSearch(
       if (expired.rows.length > 0) {
         await sendText(
           passengerPhone,
-          '😔 Ningún conductor pudo tomar tu solicitud en este momento. Por favor envíanos nuevamente tu *ubicación actual* para intentar de nuevo.'
+          `😔 Lo sentimos${nameTag}, ningún conductor pudo tomar tu solicitud en este momento. Por favor envíanos nuevamente tu *ubicación actual* para intentar de nuevo.`
         );
       }
     } catch (err) {
@@ -165,17 +225,25 @@ function scheduleExpandedSearch(
   }, FINAL_TIMEOUT_MS);
 }
 
-app.post('/webhook/whatsapp', async (req, res) => {
+app.get(['/', '/health'], (_req, res) =>
+  res.json({ ok: true, service: 'taxi-caldas-backend' })
+);
+
+app.post(['/webhook/whatsapp', '/webhook/whatsapp/*'], async (req, res) => {
   res.sendStatus(200);
 
   try {
     const { event, data } = req.body;
-    console.log(`📩 Webhook evento: ${event}`);
-    if (String(event || "").toLowerCase() !== 'messages.upsert' || !data?.message) return;
+    if (
+      String(event || '').toLowerCase() !== 'messages.upsert' ||
+      !data?.message
+    ) {
+      return;
+    }
 
     const msgId = data.key?.id;
     if (msgId) {
-      const isFirst = await redis.set(`dedup:msg:${msgId}`, "1", "EX", 60, "NX");
+      const isFirst = await redis.set(`dedup:msg:${msgId}`, '1', 'EX', 60, 'NX');
       if (!isFirst) return;
     }
 
@@ -184,18 +252,32 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
     const altJid: string = data.key?.remoteJidAlt || '';
     const effectiveJid = rawJid.endsWith('@lid') && altJid ? altJid : rawJid;
-    const from = effectiveJid.endsWith('@lid') ? effectiveJid : effectiveJid.replace('@s.whatsapp.net', '');
+    const from = effectiveJid.endsWith('@lid')
+      ? effectiveJid
+      : effectiveJid.replace('@s.whatsapp.net', '');
 
-    const msg = data.message;
-    const text = (msg.conversation || msg.extendedTextMessage?.text || '').trim();
+    const rawMsg = data.message;
+    const msg =
+      rawMsg?.ephemeralMessage?.message ||
+      rawMsg?.viewOnceMessage?.message ||
+      rawMsg?.viewOnceMessageV2?.message ||
+      rawMsg;
+
+    const text = (
+      msg.conversation ||
+      msg.extendedTextMessage?.text ||
+      ''
+    ).trim();
     const upperText = text.toUpperCase();
     const location = msg.locationMessage || msg.liveLocationMessage;
     const imageMsg = msg.imageMessage;
     const videoMsg = msg.videoMessage;
     const audioMsg = msg.audioMessage;
     const docMsg = msg.documentMessage;
+    const pushName: string | null = data.pushName || null;
 
-    const { centralPhone, adminPhones, tripCommission } = await getRuntimeConfig();
+    const { centralPhone, adminPhones, tripCommission } =
+      await getRuntimeConfig();
 
     const isFromMe = Boolean(data.key?.fromMe);
     const isAdmin = adminPhones.includes(from.replace('@lid', ''));
@@ -204,7 +286,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
     if (isFromMe && !(isAdmin && isSlashCommand)) return;
 
     console.log(
-      `👤 De: ${from} | Texto: "${text}" | GPS: ${Boolean(location)} | Img: ${Boolean(imageMsg)}`
+      `👤 De: ${from} (${pushName || 'Sin pushName'}) | Texto: "${text}" | GPS: ${Boolean(location)}`
     );
 
     // 0. COMANDOS ADMINISTRATIVOS
@@ -221,7 +303,10 @@ app.post('/webhook/whatsapp', async (req, res) => {
           return;
         }
         const list = pending.rows
-          .map((d) => `• *${d.plate}* - ${d.full_name} (${d.vehicle_model}) | Tel: ${d.phone}`)
+          .map(
+            (d) =>
+              `• *${d.plate}* - ${d.full_name} (${d.vehicle_model}) | Tel: ${d.phone}`
+          )
           .join('\n');
         await sendText(
           from,
@@ -235,7 +320,10 @@ app.post('/webhook/whatsapp', async (req, res) => {
         const bonus = Math.max(0, Number(parts[2] || 0));
 
         if (!plate) {
-          await sendText(from, '⚠️ Uso correcto: */aprobar PLACA [BONO_INICIAL]*\nEj: /aprobar ABC-123 5000');
+          await sendText(
+            from,
+            '⚠️ Uso correcto: */aprobar PLACA [BONO_INICIAL]*\nEj: /aprobar ABC-123 5000'
+          );
           return;
         }
 
@@ -248,7 +336,10 @@ app.post('/webhook/whatsapp', async (req, res) => {
         );
 
         if (drvRes.rows.length === 0) {
-          await sendText(from, `❌ No se encontró ningún conductor con placa *${plate}*.`);
+          await sendText(
+            from,
+            `❌ No se encontró ningún conductor con placa *${plate}*.`
+          );
           return;
         }
 
@@ -266,7 +357,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
         );
         await sendText(
           drv.phone,
-          `🎉 *¡Tu cuenta en Taxi Caldas ha sido aprobada!*\n\n🚕 Placa: *${drv.plate}*\n💰 Saldo disponible: *${formatCOP(drv.balance)}*\n\nPara empezar a recibir carreras, envía tu *ubicación actual* (📎 -> Ubicación).`
+          `🎉 *¡Tu cuenta en Taxi Caldas ha sido aprobada, ${drv.full_name}!*\n\n🚕 Placa: *${drv.plate}*\n💰 Saldo disponible: *${formatCOP(drv.balance)}*\n\nPara empezar a recibir carreras, envía tu *ubicación actual* (📎 -> Ubicación).`
         );
         return;
       }
@@ -276,7 +367,10 @@ app.post('/webhook/whatsapp', async (req, res) => {
         const amount = Number(parts[2] || 0);
 
         if (!plate || isNaN(amount) || amount <= 0) {
-          await sendText(from, '⚠️ Uso correcto: */recargar PLACA MONTO*\nEj: /recargar ABC-123 20000');
+          await sendText(
+            from,
+            '⚠️ Uso correcto: */recargar PLACA MONTO*\nEj: /recargar ABC-123 20000'
+          );
           return;
         }
 
@@ -286,7 +380,10 @@ app.post('/webhook/whatsapp', async (req, res) => {
         );
 
         if (drvRes.rows.length === 0) {
-          await sendText(from, `❌ No se encontró ningún conductor con placa *${plate}*.`);
+          await sendText(
+            from,
+            `❌ No se encontró ningún conductor con placa *${plate}*.`
+          );
           return;
         }
 
@@ -302,7 +399,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
         );
         await sendText(
           drv.phone,
-          `💳 *¡Recarga acreditada en Taxi Caldas!*\n\n➕ Valor recargado: *${formatCOP(amount)}*\n💰 Nuevo saldo disponible: *${formatCOP(drv.balance)}*\n\nEnvía tu *ubicación* (📎 -> Ubicación) o escribe *ACTIVO* para recibir servicios.`
+          `💳 *¡Recarga acreditada en Taxi Caldas, ${drv.full_name}!*\n\n➕ Valor recargado: *${formatCOP(amount)}*\n💰 Nuevo saldo disponible: *${formatCOP(drv.balance)}*\n\nEnvía tu *ubicación* (📎 -> Ubicación) o escribe *ACTIVO* para recibir servicios.`
         );
         return;
       }
@@ -322,13 +419,19 @@ app.post('/webhook/whatsapp', async (req, res) => {
         await db.query(
           `INSERT INTO chat_logs (trip_id, sender_role, sender_phone, receiver_phone, message_type, content)
            VALUES ($1, $2, $3, 'CENTRAL_ADMIN', 'SOS', $4)`,
-          [session.tripId, session.role, from, `🚨 ALERTA SOS ACTIVADA: ${text}`]
+          [
+            session.tripId,
+            session.role,
+            from,
+            `🚨 ALERTA SOS ACTIVADA: ${text}`,
+          ]
         );
 
         const detailRes = await db.query(
           `SELECT
              t.id AS trip_id,
              t.passenger_phone,
+             p.full_name AS passenger_name,
              ST_Y(t.pickup_location::geometry) AS pickup_lat,
              ST_X(t.pickup_location::geometry) AS pickup_lng,
              d.full_name AS driver_name,
@@ -339,6 +442,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
              ST_X(d.location::geometry) AS drv_lng
            FROM trips t
            LEFT JOIN drivers d ON t.driver_id = d.id
+           LEFT JOIN passengers p ON t.passenger_phone = p.phone
            WHERE t.id = $1`,
           [session.tripId]
         );
@@ -357,11 +461,15 @@ app.post('/webhook/whatsapp', async (req, res) => {
           logsRes.rows.length > 0
             ? logsRes.rows
                 .reverse()
-                .map((l) => `• ${l.sender_role === 'PASSENGER' ? 'Pasajero' : 'Conductor'}: ${l.content}`)
+                .map(
+                  (l) =>
+                    `• ${l.sender_role === 'PASSENGER' ? 'Pasajero' : 'Conductor'}: ${l.content}`
+                )
                 .join('\n')
             : 'Sin mensajes previos.';
 
-        const whoLabel = session.role === 'PASSENGER' ? '👤 PASAJERO' : '🚕 CONDUCTOR';
+        const whoLabel =
+          session.role === 'PASSENGER' ? '👤 PASAJERO' : '🚕 CONDUCTOR';
         const pickupMap = info?.pickup_lat
           ? `https://maps.google.com/?q=${info.pickup_lat},${info.pickup_lng}`
           : 'No disponible';
@@ -375,7 +483,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
           `Servicio ID: *#${session.tripId}*\n\n` +
           `🚕 *Vehículo:* ${info?.vehicle_model || 'N/A'} | Placa: *${info?.driver_plate || 'N/A'}*\n` +
           `👨‍✈️ *Conductor:* ${info?.driver_name || 'N/A'} (Tel: ${info?.driver_phone || 'N/A'})\n` +
-          `🙋 *Pasajero:* ${info?.passenger_phone || 'N/A'}\n\n` +
+          `🙋 *Pasajero:* ${info?.passenger_name || 'Sin nombre'} (${info?.passenger_phone || 'N/A'})\n\n` +
           `📍 *Punto de recogida:* ${pickupMap}\n` +
           `🛰️ *Último GPS taxi:* ${driverMap}\n\n` +
           `💬 *Últimos mensajes del chat:*\n${recentChat}`;
@@ -392,7 +500,11 @@ app.post('/webhook/whatsapp', async (req, res) => {
       }
 
       if (upperText === 'CANCELAR') {
-        await redis.del(`session:${from}`, `session:${session.peerPhone}`, `trip:lock:${session.tripId}`);
+        await redis.del(
+          `session:${from}`,
+          `session:${session.peerPhone}`,
+          `trip:lock:${session.tripId}`
+        );
 
         if (session.role === 'PASSENGER') {
           const client = await db.connect();
@@ -411,7 +523,12 @@ app.post('/webhook/whatsapp', async (req, res) => {
             if (refundedDriver) {
               await client.query(
                 `INSERT INTO wallet_transactions (driver_id, amount, type, trip_id, description) VALUES ($1, $2, 'REFUND', $3, $4)`,
-                [refundedDriver.id, tripCommission, session.tripId, `Reembolso cancelación pasajero #${session.tripId}`]
+                [
+                  refundedDriver.id,
+                  tripCommission,
+                  session.tripId,
+                  `Reembolso cancelación pasajero #${session.tripId}`,
+                ]
               );
             }
             await client.query('COMMIT');
@@ -435,7 +552,9 @@ app.post('/webhook/whatsapp', async (req, res) => {
             `UPDATE trips SET status = 'CANCELLED', cancelled_by = 'DRIVER', cancelled_at = NOW() WHERE id = $1`,
             [session.tripId]
           );
-          await db.query(`UPDATE drivers SET status = 'AVAILABLE' WHERE phone = $1`, [from]);
+          await db.query(`UPDATE drivers SET status = 'AVAILABLE' WHERE phone = $1`, [
+            from,
+          ]);
 
           await sendText(
             from,
@@ -450,14 +569,21 @@ app.post('/webhook/whatsapp', async (req, res) => {
       }
 
       if (session.role === 'DRIVER' && upperText === 'FIN') {
-        await db.query(`UPDATE trips SET status = 'COMPLETED', completed_at = NOW() WHERE id = $1`, [session.tripId]);
+        await db.query(
+          `UPDATE trips SET status = 'COMPLETED', completed_at = NOW() WHERE id = $1`,
+          [session.tripId]
+        );
         const drvRes = await db.query(
           `UPDATE drivers SET status = 'AVAILABLE' WHERE phone = $1 RETURNING id, full_name, plate`,
           [from]
         );
         const drv = drvRes.rows[0];
 
-        await redis.del(`session:${from}`, `session:${session.peerPhone}`, `trip:lock:${session.tripId}`);
+        await redis.del(
+          `session:${from}`,
+          `session:${session.peerPhone}`,
+          `trip:lock:${session.tripId}`
+        );
 
         if (drv) {
           await redis.set(
@@ -473,7 +599,10 @@ app.post('/webhook/whatsapp', async (req, res) => {
           );
         }
 
-        await sendText(from, '✅ Servicio finalizado. Quedas *DISPONIBLE* para nuevas carreras.');
+        await sendText(
+          from,
+          '✅ Servicio finalizado. Quedas *DISPONIBLE* para nuevas carreras.'
+        );
         await sendText(
           session.peerPhone,
           `🏁 *¡Tu viaje ha finalizado!*\n\n¿Cómo calificarías el servicio de *${drv?.full_name || 'tu conductor'}* (*${drv?.plate || ''}*)?\n\nResponde con un número del *1* al *5*:\n⭐⭐⭐⭐⭐ *5* - Excelente\n⭐⭐⭐⭐ *4* - Muy bueno\n⭐⭐⭐ *3* - Regular\n⭐⭐ *2* - Malo\n⭐ *1* - Muy malo\n\n_(O escribe *OMITIR* para saltar)_`
@@ -481,7 +610,8 @@ app.post('/webhook/whatsapp', async (req, res) => {
         return;
       }
 
-      const prefix = session.role === 'PASSENGER' ? '👤 *Pasajero:*' : '🚕 *Conductor:*';
+      const prefix =
+        session.role === 'PASSENGER' ? '👤 *Pasajero:*' : '🚕 *Conductor:*';
 
       if (text) {
         await sendText(session.peerPhone, `${prefix} ${text}`);
@@ -501,7 +631,13 @@ app.post('/webhook/whatsapp', async (req, res) => {
         );
         await db.query(
           `INSERT INTO chat_logs (trip_id, sender_role, sender_phone, receiver_phone, message_type, content) VALUES ($1, $2, $3, $4, 'IMAGE', $5)`,
-          [session.tripId, session.role, from, session.peerPhone, imageMsg.caption || '[Imagen]']
+          [
+            session.tripId,
+            session.role,
+            from,
+            session.peerPhone,
+            imageMsg.caption || '[Imagen]',
+          ]
         );
       } else if (videoMsg) {
         const media = await getMediaBase64(data);
@@ -515,7 +651,13 @@ app.post('/webhook/whatsapp', async (req, res) => {
         );
         await db.query(
           `INSERT INTO chat_logs (trip_id, sender_role, sender_phone, receiver_phone, message_type, content) VALUES ($1, $2, $3, $4, 'VIDEO', $5)`,
-          [session.tripId, session.role, from, session.peerPhone, videoMsg.caption || '[Video]']
+          [
+            session.tripId,
+            session.role,
+            from,
+            session.peerPhone,
+            videoMsg.caption || '[Video]',
+          ]
         );
       } else if (audioMsg) {
         const media = await getMediaBase64(data);
@@ -533,7 +675,13 @@ app.post('/webhook/whatsapp', async (req, res) => {
         );
         await db.query(
           `INSERT INTO chat_logs (trip_id, sender_role, sender_phone, receiver_phone, message_type, content) VALUES ($1, $2, $3, $4, 'LOCATION', $5)`,
-          [session.tripId, session.role, from, session.peerPhone, `${location.degreesLatitude},${location.degreesLongitude}`]
+          [
+            session.tripId,
+            session.role,
+            from,
+            session.peerPhone,
+            `${location.degreesLatitude},${location.degreesLongitude}`,
+          ]
         );
       }
       return;
@@ -546,7 +694,10 @@ app.post('/webhook/whatsapp', async (req, res) => {
         await redis.del(`rate:${from}`);
       } else if (upperText === 'OMITIR') {
         await redis.del(`rate:${from}`);
-        await sendText(from, '👌 Calificación omitida. Cuando necesites otro taxi, envíanos tu ubicación.');
+        await sendText(
+          from,
+          '👌 Calificación omitida. Cuando necesites otro taxi, envíanos tu ubicación.'
+        );
         return;
       } else {
         const match = text.match(/^([1-5])(\s|$|\*|⭐)/);
@@ -554,7 +705,10 @@ app.post('/webhook/whatsapp', async (req, res) => {
           const score = Number(match[1]);
           const rateState = JSON.parse(rateRaw);
 
-          await db.query(`UPDATE trips SET rating = $1 WHERE id = $2`, [score, rateState.tripId]);
+          await db.query(`UPDATE trips SET rating = $1 WHERE id = $2`, [
+            score,
+            rateState.tripId,
+          ]);
           const drvUpdate = await db.query(
             `UPDATE drivers
              SET rating_avg = ROUND(((COALESCE(rating_avg, 5.0) * COALESCE(rating_count, 0)) + $1)::numeric / (COALESCE(rating_count, 0) + 1), 2),
@@ -567,7 +721,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
           await redis.del(`rate:${from}`);
           await sendText(
             from,
-            `🙏 *¡Gracias por tu calificación de ${score}/5!*\nTu opinión nos ayuda a mantener el mejor servicio.`
+            `🙏 *¡Gracias por tu calificación de ${score}/5!*\nTu opinión nos ayuda a mantener el mejor servicio en *Taxi Caldas*.`
           );
 
           const updatedDrv = drvUpdate.rows[0];
@@ -601,8 +755,10 @@ app.post('/webhook/whatsapp', async (req, res) => {
       }
     }
 
-    // 2. FLUJO DE CONDUCTOR YA REGISTRADO
-    const driverRes = await db.query(`SELECT * FROM drivers WHERE phone = $1`, [from]);
+    // 2. FLUJO DE CONDUCTOR YA REGISTRADO EN BASE DE DATOS
+    const driverRes = await db.query(`SELECT * FROM drivers WHERE phone = $1`, [
+      from,
+    ]);
     if (driverRes.rows.length > 0) {
       const driver = driverRes.rows[0];
       const cmd = upperText;
@@ -627,20 +783,28 @@ app.post('/webhook/whatsapp', async (req, res) => {
         const history =
           txs.rows.length > 0
             ? txs.rows
-                .map((t) => `• ${t.fecha}: *${t.amount >= 0 ? '+' : ''}${formatCOP(t.amount)}* (${t.description})`)
+                .map(
+                  (t) =>
+                    `• ${t.fecha}: *${t.amount >= 0 ? '+' : ''}${formatCOP(t.amount)}* (${t.description})`
+                )
                 .join('\n')
             : 'Sin movimientos aún.';
 
         await sendText(
           from,
-          `💰 *Tu Billetera Prepago*\n\nSaldo actual: *${formatCOP(driver.balance)}*\nCalificación: *${driver.rating_avg || '5.00'} ⭐*\nComisión por servicio: *${formatCOP(tripCommission)}*\n\n*Últimos movimientos:*\n${history}\n\nPara recargar, transfiere vía Nequi/Llave al *${centralPhone.replace(/^57/, '')}* indicando tu placa *${driver.plate}*.`
+          `💰 *Tu Billetera Prepago, ${driver.full_name}*\n\nSaldo actual: *${formatCOP(driver.balance)}*\nCalificación: *${driver.rating_avg || '5.00'} ⭐*\nComisión por servicio: *${formatCOP(tripCommission)}*\n\n*Últimos movimientos:*\n${history}\n\nPara recargar, transfiere vía Nequi/Llave al *${centralPhone.replace(/^57/, '')}* indicando tu placa *${driver.plate}*.`
         );
         return;
       }
 
       if (cmd === 'PAUSA') {
-        await db.query(`UPDATE drivers SET status = 'OFFLINE' WHERE id = $1`, [driver.id]);
-        await sendText(from, '🔴 Turno pausado. Escribe *ACTIVO* o envía tu ubicación cuando vuelvas a operar.');
+        await db.query(`UPDATE drivers SET status = 'OFFLINE' WHERE id = $1`, [
+          driver.id,
+        ]);
+        await sendText(
+          from,
+          `🔴 Turno pausado, *${driver.full_name}*. Escribe *ACTIVO* o envía tu ubicación cuando vuelvas a operar.`
+        );
         return;
       }
 
@@ -655,10 +819,12 @@ app.post('/webhook/whatsapp', async (req, res) => {
       }
 
       if (cmd === 'ACTIVO') {
-        await db.query(`UPDATE drivers SET status = 'AVAILABLE' WHERE id = $1`, [driver.id]);
+        await db.query(`UPDATE drivers SET status = 'AVAILABLE' WHERE id = $1`, [
+          driver.id,
+        ]);
         await sendText(
           from,
-          `🟢 Estás *DISPONIBLE* (Saldo: *${formatCOP(driver.balance)}*).\nEnvíame tu ubicación actual (📎 -> Ubicación) para recibir servicios cercanos.`
+          `🟢 Estás *DISPONIBLE*, *${driver.full_name}* (Saldo: *${formatCOP(driver.balance)}*).\nEnvíame tu ubicación actual (📎 -> Ubicación) para recibir servicios cercanos.`
         );
         return;
       }
@@ -670,7 +836,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
         );
         await sendText(
           from,
-          `📍 Ubicación GPS actualizada (Saldo: *${formatCOP(driver.balance)}*). Buscando pasajeros cerca de ti...`
+          `📍 Ubicación GPS actualizada, *${driver.full_name}* (Saldo: *${formatCOP(driver.balance)}*). Buscando pasajeros cerca de ti...`
         );
         return;
       }
@@ -685,9 +851,18 @@ app.post('/webhook/whatsapp', async (req, res) => {
           return;
         }
 
-        const lock = await redis.set(`trip:lock:${pendingTripId}`, driver.id, 'EX', 3600, 'NX');
+        const lock = await redis.set(
+          `trip:lock:${pendingTripId}`,
+          driver.id,
+          'EX',
+          3600,
+          'NX'
+        );
         if (!lock) {
-          await sendText(from, '⚠️ Lo sentimos, otro conductor acaba de tomar este servicio.');
+          await sendText(
+            from,
+            '⚠️ Lo sentimos, otro conductor acaba de tomar este servicio.'
+          );
           return;
         }
 
@@ -706,7 +881,10 @@ app.post('/webhook/whatsapp', async (req, res) => {
           if (tripCheck.rows.length === 0) {
             await client.query('ROLLBACK');
             await redis.del(`trip:lock:${pendingTripId}`, `offer:${from}`);
-            await sendText(from, '⚠️ Este servicio ya fue cancelado por el pasajero o tomado.');
+            await sendText(
+              from,
+              '⚠️ Este servicio ya fue cancelado por el pasajero o tomado.'
+            );
             return;
           }
 
@@ -751,18 +929,38 @@ app.post('/webhook/whatsapp', async (req, res) => {
           client.release();
         }
 
+        const passRes = await db.query(
+          `SELECT full_name FROM passengers WHERE phone = $1`,
+          [trip.passenger_phone]
+        );
+        const passengerName = passRes.rows[0]?.full_name || null;
+
         await redis.del(`offer:${from}`);
-        await redis.set(`session:${trip.passenger_phone}`, JSON.stringify({ tripId: trip.id, role: 'PASSENGER', peerPhone: from }), 'EX', 7200);
-        await redis.set(`session:${from}`, JSON.stringify({ tripId: trip.id, role: 'DRIVER', peerPhone: trip.passenger_phone }), 'EX', 7200);
+        await redis.set(
+          `session:${trip.passenger_phone}`,
+          JSON.stringify({ tripId: trip.id, role: 'PASSENGER', peerPhone: from }),
+          'EX',
+          7200
+        );
+        await redis.set(
+          `session:${from}`,
+          JSON.stringify({
+            tripId: trip.id,
+            role: 'DRIVER',
+            peerPhone: trip.passenger_phone,
+          }),
+          'EX',
+          7200
+        );
 
         await sendText(
           trip.passenger_phone,
-          `✅ *¡Taxi asignado!*\n\n🚕 Vehículo: *${driver.vehicle_model}*\n🔢 Placa: *${driver.plate}*\n👤 Conductor: *${driver.full_name}* (${driver.rating_avg || '5.00'} ⭐)\n\nPuedes enviar mensajes, fotos, videos o notas de voz por este chat (tu número permanece privado).\n• Escribe *CANCELAR* para cancelar\n• Escribe *SOS* en caso de emergencia`
+          `✅ *¡Taxi asignado${passengerName ? `, ${passengerName}` : ''}!*\n\n🚕 Vehículo: *${driver.vehicle_model}*\n🔢 Placa: *${driver.plate}*\n👤 Conductor: *${driver.full_name}* (${driver.rating_avg || '5.00'} ⭐)\n\nPuedes enviar mensajes, fotos, videos o notas de voz por este chat (tu número permanece privado).\n• Escribe *CANCELAR* para cancelar\n• Escribe *SOS* en caso de emergencia`
         );
 
         await sendText(
           from,
-          `✅ *¡Servicio asignado a ti!*\n💸 Comisión descontada: *-${formatCOP(tripCommission)}*\n💰 Saldo restante: *${formatCOP(newBalance)}*\n\nEscribe o envía audios/fotos por aquí para hablar con el pasajero.\n• *FIN* - Terminar viaje\n• *CANCELAR* - Cancelar servicio\n• *SOS* - Emergencia`
+          `✅ *¡Servicio asignado a ti!*\n👤 Pasajero: *${passengerName || 'Cliente Taxi Caldas'}*\n💸 Comisión descontada: *-${formatCOP(tripCommission)}*\n💰 Saldo restante: *${formatCOP(newBalance)}*\n\nEscribe o envía audios/fotos por aquí para hablar con el pasajero.\n• *FIN* - Terminar viaje\n• *CANCELAR* - Cancelar servicio\n• *SOS* - Emergencia`
         );
         await sendLocation(from, trip.lat, trip.lng, 'Punto de recogida');
         return;
@@ -780,18 +978,29 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
     if (upperText === 'CANCELAR' && regRaw) {
       await redis.del(`reg:${from}`);
-      await sendText(from, '❌ Registro cancelado. Si deseas pedir un taxi, envía tu ubicación.');
+      await sendText(
+        from,
+        '❌ Registro cancelado. Si deseas pedir un taxi, envía tu ubicación.'
+      );
       return;
     }
 
     if (
       !regRaw &&
-      (upperText === 'SOY TAXISTA' || upperText === 'REGISTRO' || upperText === 'REGISTRARME')
+      (upperText === 'SOY TAXISTA' ||
+        upperText === 'REGISTRO' ||
+        upperText === 'REGISTRARME')
     ) {
-      await redis.set(`reg:${from}`, JSON.stringify({ step: 'ASK_NAME' }), 'EX', 1800);
+      await redis.del(`ask_name:${from}`);
+      await redis.set(
+        `reg:${from}`,
+        JSON.stringify({ step: 'ASK_NAME' }),
+        'EX',
+        1800
+      );
       await sendText(
         from,
-        '🚕 *Registro de Conductor*\n\nVamos a crear tu perfil en 4 pasos rápidos (escribe *CANCELAR* en cualquier momento para salir).\n\n1️⃣ Por favor escribe tu *nombre y apellido*:'
+        '🚕 *Registro de Conductor - Taxi Caldas*\n\nVamos a guardar tu perfil en nuestra base de datos en 4 pasos rápidos (escribe *CANCELAR* en cualquier momento para salir).\n\n1️⃣ Por favor escribe tu *nombre y apellido*:'
       );
       return;
     }
@@ -801,25 +1010,40 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
       if (regState.step === 'ASK_NAME') {
         if (text.length < 3) {
-          await sendText(from, '⚠️ Por favor escribe tu nombre completo (mínimo 3 letras):');
+          await sendText(
+            from,
+            '⚠️ Por favor escribe tu nombre completo (mínimo 3 letras):'
+          );
           return;
         }
-        regState.fullName = text;
+        regState.fullName = formatProperName(text);
         regState.step = 'ASK_PLATE';
         await redis.set(`reg:${from}`, JSON.stringify(regState), 'EX', 1800);
-        await sendText(from, '2️⃣ Ahora escribe la *placa* de tu taxi (Ej: *WXY-123*):');
+        await sendText(
+          from,
+          `2️⃣ Gracias *${regState.fullName}*. Ahora escribe la *placa* de tu taxi (Ej: *WXY-123*):`
+        );
         return;
       }
 
       if (regState.step === 'ASK_PLATE') {
         const cleanPlate = text.toUpperCase().replace(/\s+/g, '');
         if (cleanPlate.length < 5) {
-          await sendText(from, '⚠️ Placa no válida. Escríbela nuevamente (Ej: *WXY-123*):');
+          await sendText(
+            from,
+            '⚠️ Placa no válida. Escríbela nuevamente (Ej: *WXY-123*):'
+          );
           return;
         }
-        const exists = await db.query(`SELECT id FROM drivers WHERE UPPER(plate) = $1`, [cleanPlate]);
+        const exists = await db.query(
+          `SELECT id FROM drivers WHERE UPPER(plate) = $1`,
+          [cleanPlate]
+        );
         if (exists.rows.length > 0) {
-          await sendText(from, `⚠️ La placa *${cleanPlate}* ya está registrada. Escribe otra placa o *CANCELAR*:`);
+          await sendText(
+            from,
+            `⚠️ La placa *${cleanPlate}* ya está registrada. Escribe otra placa o *CANCELAR*:`
+          );
           return;
         }
         regState.plate = cleanPlate;
@@ -834,7 +1058,10 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
       if (regState.step === 'ASK_MODEL') {
         if (text.length < 3) {
-          await sendText(from, '⚠️ Indica el modelo y color del vehículo (Ej: *Hyundai i10 Amarillo*):');
+          await sendText(
+            from,
+            '⚠️ Indica el modelo y color del vehículo (Ej: *Hyundai i10 Amarillo*):'
+          );
           return;
         }
         regState.vehicleModel = text;
@@ -860,19 +1087,28 @@ app.post('/webhook/whatsapp', async (req, res) => {
         const ext = docMsg ? 'pdf' : 'jpg';
         const fileName = `${from}_${Date.now()}.${ext}`;
         const relativePath = `uploads/drivers/${fileName}`;
-        fs.writeFileSync(path.join(process.cwd(), relativePath), Buffer.from(media.base64, 'base64'));
+        fs.writeFileSync(
+          path.join(process.cwd(), relativePath),
+          Buffer.from(media.base64, 'base64')
+        );
 
         await db.query(
           `INSERT INTO drivers (phone, full_name, plate, vehicle_model, status, is_verified, approval_status, balance, doc_photo_path)
            VALUES ($1, $2, $3, $4, 'OFFLINE', FALSE, 'PENDING', 0, $5)`,
-          [from, regState.fullName, regState.plate, regState.vehicleModel, relativePath]
+          [
+            from,
+            regState.fullName,
+            regState.plate,
+            regState.vehicleModel,
+            relativePath,
+          ]
         );
 
         await redis.del(`reg:${from}`);
 
         await sendText(
           from,
-          `✅ *¡Solicitud de registro enviada!*\n\n👤 Nombre: *${regState.fullName}*\n🔢 Placa: *${regState.plate}*\n🚕 Vehículo: *${regState.vehicleModel}*\n\nValidaremos tus documentos y te activaremos por este mismo chat.`
+          `✅ *¡Solicitud de registro guardada, ${regState.fullName}!*\n\n🔢 Placa: *${regState.plate}*\n🚕 Vehículo: *${regState.vehicleModel}*\n\nValidaremos tus documentos y te activaremos por este mismo chat.`
         );
 
         const adminPhone = adminPhones[0];
@@ -894,8 +1130,12 @@ app.post('/webhook/whatsapp', async (req, res) => {
       }
     }
 
-    // 4. FLUJO DE PASAJERO (PROTECCIÓN CONTRA SOLICITUDES DUPLICADAS)
+    // 4. REGISTRO AUTOMÁTICO DE CLIENTE / PASAJERO EN BASE DE DATOS
+    const passenger = await upsertPassenger(from, pushName);
+    const passengerName: string | null = passenger?.full_name || null;
+
     if (upperText === 'CANCELAR') {
+      await redis.del(`ask_name:${from}`);
       const searchingTrip = await db.query(
         `UPDATE trips
          SET status = 'CANCELLED', cancelled_by = 'PASSENGER', cancelled_at = NOW()
@@ -908,17 +1148,20 @@ app.post('/webhook/whatsapp', async (req, res) => {
         [from]
       );
       if (searchingTrip.rows.length > 0) {
-        await sendText(from, '❌ Hemos cancelado tu búsqueda de taxi.');
+        await sendText(
+          from,
+          `❌ Hemos cancelado tu búsqueda de taxi${passengerName ? `, *${passengerName}*` : ''}.`
+        );
       } else {
         await sendText(
           from,
-          'ℹ️ No tienes ningún servicio activo para cancelar. Envía tu *ubicación actual* para pedir un taxi.'
+          `ℹ️ No tienes ningún servicio activo para cancelar${passengerName ? `, *${passengerName}*` : ''}. Envía tu *ubicación actual* para pedir un taxi.`
         );
       }
       return;
     }
 
-    // Verificar si el pasajero ya tiene una búsqueda o viaje activo en PostgreSQL
+    // Verificar si el pasajero ya tiene una búsqueda o viaje activo
     const existingTripRes = await db.query(
       `SELECT t.id, t.status, d.plate AS driver_plate, d.full_name AS driver_name, d.phone AS driver_phone
        FROM trips t
@@ -932,45 +1175,59 @@ app.post('/webhook/whatsapp', async (req, res) => {
     if (existingTripRes.rows.length > 0) {
       const existing = existingTripRes.rows[0];
 
-      // Si el viaje está ACTIVE pero expiró la sesión en Redis, restaurarla automáticamente
       if (existing.status === 'ACTIVE' && existing.driver_phone) {
         await redis.set(
           `session:${from}`,
-          JSON.stringify({ tripId: existing.id, role: 'PASSENGER', peerPhone: existing.driver_phone }),
+          JSON.stringify({
+            tripId: existing.id,
+            role: 'PASSENGER',
+            peerPhone: existing.driver_phone,
+          }),
           'EX',
           7200
         );
         await redis.set(
           `session:${existing.driver_phone}`,
-          JSON.stringify({ tripId: existing.id, role: 'DRIVER', peerPhone: from }),
+          JSON.stringify({
+            tripId: existing.id,
+            role: 'DRIVER',
+            peerPhone: from,
+          }),
           'EX',
           7200
         );
         await sendText(
           from,
-          `🚕 Ya tienes un taxi asignado en curso (*${existing.driver_plate}* - ${existing.driver_name}).\nPuedes escribirle directamente por aquí o enviar *CANCELAR* si deseas anularlo.`
+          `🚕 ${passengerName ? `*${passengerName}*, ya` : 'Ya'} tienes un taxi asignado en curso (*${existing.driver_plate}* - ${existing.driver_name}).\nPuedes escribirle directamente por aquí o enviar *CANCELAR* si deseas anularlo.`
         );
         return;
       }
 
-      // Si sigue en SEARCHING, bloquear nueva solicitud y avisar el estado actual
       if (location) {
         await sendText(
           from,
-          `⏳ *Ya tienes una solicitud de taxi en curso (Servicio #${existing.id}).*\nEstamos alertando a los conductores cercanos. Por favor espera un momento o escribe *CANCELAR* si deseas anularla antes de pedir otro.`
+          `⏳ *Ya tienes una solicitud de taxi en curso (Servicio #${existing.id})${passengerName ? `, ${passengerName}` : ''}.*\nEstamos alertando a los conductores cercanos. Por favor espera un momento o escribe *CANCELAR* si deseas anularla antes de pedir otro.`
         );
       } else {
         await sendText(
           from,
-          `⏳ Seguimos buscando un taxi cercano para tu solicitud *#${existing.id}*. Te avisaremos apenas un conductor acepte.\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
+          `⏳ Seguimos buscando un taxi cercano para tu solicitud *#${existing.id}*${passengerName ? `, *${passengerName}*` : ''}. Te avisaremos apenas un conductor acepte.\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
         );
       }
       return;
     }
 
+    // Si envía ubicación GPS: despachar de inmediato (sin frenar al cliente aunque aún no haya dado nombre)
     if (location) {
-      // Bloqueo breve en Redis contra doble envío simultáneo en milisegundos
-      const reqLock = await redis.set(`passenger:req_lock:${from}`, '1', 'EX', 5, 'NX');
+      await redis.del(`ask_name:${from}`);
+
+      const reqLock = await redis.set(
+        `passenger:req_lock:${from}`,
+        '1',
+        'EX',
+        5,
+        'NX'
+      );
       if (!reqLock) {
         await sendText(from, '⏳ Procesando tu ubicación, un momento por favor...');
         return;
@@ -1000,7 +1257,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
       if (nearbyDrivers.length === 0) {
         await sendText(
           from,
-          '😔 No encontramos taxis disponibles a menos de 5 km de tu ubicación en este momento. Intenta nuevamente en un par de minutos.'
+          `😔 Lo sentimos${passengerName ? ` *${passengerName}*` : ''}, no encontramos taxis disponibles a menos de 5 km de tu ubicación en este momento. Intenta nuevamente en un par de minutos.`
         );
         return;
       }
@@ -1012,6 +1269,10 @@ app.post('/webhook/whatsapp', async (req, res) => {
           [from, lng, lat]
         );
         tripId = newTrip.rows[0].id;
+        await db.query(
+          `UPDATE passengers SET trips_count = trips_count + 1 WHERE phone = $1`,
+          [from]
+        );
       } catch (insertErr: any) {
         if (insertErr?.code === '23505') {
           await sendText(
@@ -1023,31 +1284,120 @@ app.post('/webhook/whatsapp', async (req, res) => {
         throw insertErr;
       }
 
+      const greetingPrefix = passengerName
+        ? `🔎 ¡Listo *${passengerName}*! Ubicación recibida.`
+        : '🔎 Ubicación recibida.';
+
       await sendText(
         from,
         usedExpandedImmediately
-          ? `🔎 Ubicación recibida. Estamos alertando a *${nearbyDrivers.length} conductores* en un radio de *5 km*...\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
-          : `🔎 Ubicación recibida. Estamos alertando a *${nearbyDrivers.length} conductores* cercanos a tu zona...\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
+          ? `${greetingPrefix} Estamos alertando a *${nearbyDrivers.length} conductores* en un radio de *5 km*...\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
+          : `${greetingPrefix} Estamos alertando a *${nearbyDrivers.length} conductores* cercanos a tu zona...\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
       );
 
-      await broadcastTripOffer(nearbyDrivers, tripId, tripCommission, usedExpandedImmediately);
+      await broadcastTripOffer(
+        nearbyDrivers,
+        tripId,
+        tripCommission,
+        usedExpandedImmediately
+      );
 
       const alertedIds = nearbyDrivers.map((d) => d.id);
-      scheduleExpandedSearch(tripId, from, lng, lat, tripCommission, alertedIds);
-    } else {
+      scheduleExpandedSearch(
+        tripId,
+        from,
+        passengerName,
+        lng,
+        lat,
+        tripCommission,
+        alertedIds
+      );
+      return;
+    }
+
+    // 5. CAPTURA O SALUDO PERSONALIZADO POR NOMBRE PARA CLIENTES
+    if (!passengerName) {
+      const waitingName = await redis.get(`ask_name:${from}`);
+
+      if (waitingName && text) {
+        if (isInvalidNameInput(text)) {
+          await sendText(
+            from,
+            '😊 Para registrarte en *Taxi Caldas* y atenderte por tu nombre, dime por favor cómo te llamas *(Ej: Carlos Pérez)*:\n\n_(O envía directamente tu *ubicación actual* 📎 -> Ubicación si necesitas el taxi de inmediato)_'
+          );
+          return;
+        }
+
+        const formattedName = formatProperName(text);
+        await db.query(
+          `UPDATE passengers SET full_name = $1, last_interaction_at = NOW() WHERE phone = $2`,
+          [formattedName, from]
+        );
+        await redis.del(`ask_name:${from}`);
+
+        await sendText(
+          from,
+          `🙌 ¡Mucho gusto, *${formattedName}*! Ya quedaste registrado en *Taxi Caldas*.\n\n📍 Cuando necesites un servicio, solo envíame tu *ubicación actual* (📎 -> Ubicación) y te asignaremos el taxi más cercano.`
+        );
+        return;
+      }
+
+      // Primera vez que escribe este número: guardamos su registro y le pedimos su nombre
+      await redis.set(`ask_name:${from}`, '1', 'EX', 3600);
       await sendText(
         from,
-        '👋 ¡Hola! Para pedir tu taxi en *Taxi Caldas* de forma rápida y segura, envíame tu *ubicación actual* (📎 -> Ubicación).\n\n🚕 _Si eres conductor y deseas afiliarte, escribe *SOY TAXISTA*._'
+        '👋 ¡Hola! Bienvenido a *Taxi Caldas*.\n\nPara brindarte una atención más rápida y personalizada, ¿cuál es tu *nombre*? 😊\n\n_(Si necesitas un taxi de inmediato, también puedes enviarme directamente tu *ubicación actual* 📎 -> Ubicación. Si eres conductor, escribe *SOY TAXISTA*)_'
       );
+      return;
     }
+
+    // Cliente ya registrado escribiendo por segunda vez o más: lo llamamos por su nombre
+    await sendText(
+      from,
+      `👋 ¡Hola *${passengerName}*! Qué gusto saludarte de nuevo en *Taxi Caldas*.\n\n📍 Envíame tu *ubicación actual* (📎 -> Ubicación) para enviarte el taxi más cercano.`
+    );
   } catch (err: any) {
     console.error('❌ Error procesando webhook:', err?.response?.data || err);
-    if (err?.code === '42P01') { await ensureDatabaseSchema(db); }
+    if (err?.code === '42P01') {
+      await ensureDatabaseSchema(db);
+    }
   }
 });
 
-ensureDatabaseSchema(db).catch((e) => console.error("❌ Error DB init:", e));
+async function registerWebhookOnBoot() {
+  const evoUrl = process.env.EVOLUTION_URL || 'http://evolution_api:8080';
+  const apiKey = process.env.EVOLUTION_API_KEY || '';
+  const instance = process.env.INSTANCE_NAME || 'central_taxi';
+  const webhookUrl = 'http://backend:4000/webhook/whatsapp';
+  for (let i = 1; i <= 6; i++) {
+    try {
+      const r = await fetch(`${evoUrl}/webhook/set/${instance}`, {
+        method: 'POST',
+        headers: { apikey: apiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          webhook: {
+            enabled: true,
+            url: webhookUrl,
+            byEvents: false,
+            base64: false,
+            events: ['MESSAGES_UPSERT'],
+          },
+        }),
+      });
+      if (r.ok) {
+        console.log('✅ Webhook vinculado automáticamente con Evolution API');
+        return;
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+}
+
+ensureDatabaseSchema(db).catch((e) => console.error('❌ Error DB init:', e));
 
 app.listen(process.env.PORT, () => {
-  console.log(`🚀 Central de Taxis corriendo en http://localhost:${process.env.PORT}`);
+  console.log(
+    `🚀 Central de Taxis corriendo en http://localhost:${process.env.PORT}`
+  );
+  registerWebhookOnBoot();
 });
