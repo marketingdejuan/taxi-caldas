@@ -1,13 +1,12 @@
 FROM node:20-bookworm-slim AS builder
 WORKDIR /app
-COPY package.json ./
+COPY package.json package-lock.json ./
 RUN npm install
 COPY . .
 ARG NEXT_PUBLIC_BACKEND_URL=http://localhost:4000
 ENV NEXT_PUBLIC_BACKEND_URL=$NEXT_PUBLIC_BACKEND_URL
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
-RUN grep -rn "bg-slate-950" .next/static/
 
 FROM node:20-bookworm-slim AS runner
 WORKDIR /app
