@@ -239,7 +239,7 @@ app.get(['/', '/health'], (_req, res) =>
   res.json({ ok: true, service: 'taxi-caldas-backend' })
 );
 
-app.post(['/webhook/whatsapp', '/webhook/whatsapp/*'], async (req, res) => {
+app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => {
   res.sendStatus(200);
 
   try {
