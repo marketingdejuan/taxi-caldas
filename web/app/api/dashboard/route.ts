@@ -26,6 +26,9 @@ export async function GET() {
       ALTER TABLE drivers ADD COLUMN IF NOT EXISTS profile_photo_path TEXT;
       ALTER TABLE drivers ADD COLUMN IF NOT EXISTS data_consent BOOLEAN DEFAULT FALSE;
       ALTER TABLE drivers ADD COLUMN IF NOT EXISTS data_consent_at TIMESTAMP WITH TIME ZONE;
+      ALTER TABLE trips ADD COLUMN IF NOT EXISTS dropoff_address TEXT;
+      ALTER TABLE trips ADD COLUMN IF NOT EXISTS distance_km NUMERIC(6,2);
+      ALTER TABLE trips ADD COLUMN IF NOT EXISTS estimated_fare INTEGER;
     `);
 
     const [driversRes, tripsRes, revenueRes, sosRes, passengersRes] =
@@ -60,7 +63,10 @@ export async function GET() {
           SELECT
             t.id,
             t.passenger_phone,
-            p.full_name AS passenger_name,
+            COALESCE(p.full_name, dp.full_name) AS passenger_name,
+            t.dropoff_address,
+            t.distance_km,
+            t.estimated_fare,
             t.status,
             t.rating,
             t.cancelled_by,
@@ -76,6 +82,7 @@ export async function GET() {
           FROM trips t
           LEFT JOIN drivers d ON t.driver_id = d.id
           LEFT JOIN passengers p ON t.passenger_phone = p.phone
+          LEFT JOIN drivers dp ON t.passenger_phone = dp.phone
           ORDER BY t.created_at DESC
           LIMIT 50
         `),

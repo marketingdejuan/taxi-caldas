@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { getAuthenticatedUser } from '@/lib/auth';
 
-const EVOLUTION_URL = process.env.EVOLUTION_URL || 'http://localhost:8080';
+const EVOLUTION_URL = process.env.EVOLUTION_URL || 'http://evolution_api:8080';
 const API_KEY = process.env.EVOLUTION_API_KEY || '';
 const INSTANCE = process.env.INSTANCE_NAME || 'central_taxi';
 const WEBHOOK_URL =
@@ -171,6 +171,9 @@ export async function GET() {
         centralPhone: settings.central_phone || '',
         adminPhones: settings.admin_phones || '573133336835',
         tripCommission: Number(settings.trip_commission || 500),
+        baseFare: Number(settings.base_fare || 5900),
+        pricePerKm: Number(settings.price_per_km || 2400),
+        minFare: Number(settings.min_fare || 8300),
         driverInviteMessage:
           settings.driver_invite_message || DEFAULT_INVITE_MSG,
       },
@@ -192,7 +195,15 @@ export async function POST(req: NextRequest) {
 
   try {
     const body = await req.json();
-    const { action, adminPhones, tripCommission, driverInviteMessage } = body;
+    const {
+      action,
+      adminPhones,
+      tripCommission,
+      baseFare,
+      pricePerKm,
+      minFare,
+      driverInviteMessage,
+    } = body;
 
     if (action === 'SAVE_SETTINGS') {
       if (typeof adminPhones === 'string') {
@@ -210,13 +221,22 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      if (tripCommission !== undefined && !isNaN(Number(tripCommission))) {
-        await db.query(
-          `INSERT INTO app_settings (key, value, updated_at)
-           VALUES ('trip_commission', $1, NOW())
-           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
-          [String(Math.max(0, Number(tripCommission)))]
-        );
+      const numericFields: Array<[string, any]> = [
+        ['trip_commission', tripCommission],
+        ['base_fare', baseFare],
+        ['price_per_km', pricePerKm],
+        ['min_fare', minFare],
+      ];
+
+      for (const [key, val] of numericFields) {
+        if (val !== undefined && !isNaN(Number(val))) {
+          await db.query(
+            `INSERT INTO app_settings (key, value, updated_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+            [key, String(Math.max(0, Number(val)))]
+          );
+        }
       }
 
       if (

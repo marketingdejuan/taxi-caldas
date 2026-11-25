@@ -1,6 +1,7 @@
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
+import axios from 'axios';
 import { Pool } from 'pg';
 import Redis from 'ioredis';
 import dotenv from 'dotenv';
@@ -40,8 +41,95 @@ const EXPANDED_RADIUS_METERS = 5000;
 const EXPAND_DELAY_MS = 45_000;
 const FINAL_TIMEOUT_MS = 120_000;
 
+interface GeoPoint {
+  lat: number;
+  lng: number;
+  label: string;
+}
+
+const KNOWN_LANDMARKS: Array<{ keys: string[]; lat: number; lng: number; label: string }> = [
+  {
+    keys: ['PARQUE DE CALDAS', 'PARQUE PRINCIPAL CALDAS', 'PARQUE CALDAS', 'CENTRO CALDAS'],
+    lat: 6.0910,
+    lng: -75.6357,
+    label: 'Parque Principal de Caldas',
+  },
+  {
+    keys: ['VARIANTE CALDAS', 'LA VARIANTE'],
+    lat: 6.0962,
+    lng: -75.6388,
+    label: 'La Variante, Caldas',
+  },
+  {
+    keys: ['LA MIEL', 'VEREDA LA MIEL'],
+    lat: 6.0772,
+    lng: -75.6295,
+    label: 'La Miel, Caldas',
+  },
+  {
+    keys: ['SALINAS', 'VEREDA SALINAS'],
+    lat: 6.0745,
+    lng: -75.6472,
+    label: 'Vereda Salinas, Caldas',
+  },
+  {
+    keys: ['LOCERIA', 'LA LOCERIA'],
+    lat: 6.0994,
+    lng: -75.6331,
+    label: 'La Locería, Caldas',
+  },
+  {
+    keys: ['HOSPITAL CALDAS', 'HOSPITAL SAN VICENTE CALDAS'],
+    lat: 6.0885,
+    lng: -75.6341,
+    label: 'Hospital San Vicente de Paúl, Caldas',
+  },
+  {
+    keys: ['ESTACION LA ESTRELLA', 'METRO LA ESTRELLA'],
+    lat: 6.1578,
+    lng: -75.6436,
+    label: 'Estación Metro La Estrella',
+  },
+  {
+    keys: ['MAYORCA', 'CENTRO COMERCIAL MAYORCA', 'SABANETA'],
+    lat: 6.1614,
+    lng: -75.6056,
+    label: 'Centro Comercial Mayorca / Sabaneta',
+  },
+  {
+    keys: ['ENVIGADO', 'PARQUE DE ENVIGADO'],
+    lat: 6.1759,
+    lng: -75.5917,
+    label: 'Parque Principal de Envigado',
+  },
+  {
+    keys: ['ITAGUI', 'PARQUE DE ITAGUI'],
+    lat: 6.1719,
+    lng: -75.6113,
+    label: 'Parque de Itagüí',
+  },
+  {
+    keys: ['POBLADO', 'EL POBLADO', 'PARQUE LLERAS', 'PROVENZA'],
+    lat: 6.2088,
+    lng: -75.5677,
+    label: 'El Poblado, Medellín',
+  },
+  {
+    keys: ['CENTRO MEDELLIN', 'PARQUE BERRIO', 'LA ALPUJARRA'],
+    lat: 6.2442,
+    lng: -75.5736,
+    label: 'Centro de Medellín',
+  },
+  {
+    keys: ['AEROPUERTO RIONEGRO', 'JOSE MARIA CORDOVA', 'AEROPUERTO JMC'],
+    lat: 6.1645,
+    lng: -75.4231,
+    label: 'Aeropuerto José María Córdova',
+  },
+];
+
 function formatCOP(value: number): string {
-  return `$${value.toLocaleString('es-CO')}`;
+  return `$${Math.round(value).toLocaleString('es-CO')}`;
 }
 
 function formatProperName(raw: string): string {
@@ -61,31 +149,42 @@ function normalizeColombianPhone(raw: string): string {
   return digits;
 }
 
+function normalizeSearchKey(text: string): string {
+  return text
+    .toUpperCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[¡!¿?.,]/g, '')
+    .trim();
+}
+
 function isConsentAccepted(upperText: string): boolean {
-  const accepted = [
-    'ACEPTO',
-    'ACEPTAR',
-    'SI',
-    'SÍ',
-    'AUTORIZO',
-    'DE ACUERDO',
-    'OK',
-    '1',
-  ];
-  return accepted.includes(upperText.trim());
+  return ['ACEPTO', 'ACEPTAR', 'SI', 'SÍ', 'AUTORIZO', 'DE ACUERDO', 'OK', '1'].includes(
+    upperText.trim()
+  );
 }
 
 function isConsentRejected(upperText: string): boolean {
   return ['NO', 'NO ACEPTO', 'RECHAZO'].includes(upperText.trim());
 }
 
-function isAmbiguousTaxiOrDriverIntent(upperText: string): boolean {
-  const clean = upperText
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[¡!¿?.,]/g, '')
-    .trim();
+function isQuoteIntent(upperText: string): boolean {
+  const clean = normalizeSearchKey(upperText);
+  return [
+    'COTIZAR',
+    'COTIZACION',
+    'TARIFA',
+    'TARIFAS',
+    'PRECIO',
+    'CUANTO VALE',
+    'CUANTO CUESTA',
+    'VALOR CARRERA',
+    'SIMULAR',
+  ].includes(clean) || clean.startsWith('COTIZAR ');
+}
 
+function isAmbiguousTaxiOrDriverIntent(upperText: string): boolean {
+  const clean = normalizeSearchKey(upperText);
   if (!clean) return false;
 
   const exactMatches = [
@@ -107,24 +206,13 @@ function isAmbiguousTaxiOrDriverIntent(upperText: string): boolean {
   ];
   if (exactMatches.includes(clean)) return true;
 
-  if (
-    /\b(SOY TAXI|SOY TAXISTA|SOY CONDUCTOR|REGISTRAR MI VEHICULO|AFILIAR TAXI|TRABAJAR EN TAXI)\b/.test(
-      clean
-    )
-  ) {
-    return true;
-  }
-
-  return false;
+  return /\b(SOY TAXI|SOY TAXISTA|SOY CONDUCTOR|REGISTRAR MI VEHICULO|AFILIAR TAXI|TRABAJAR EN TAXI)\b/.test(
+    clean
+  );
 }
 
 function isDriverWantingPassengerMode(upperText: string): boolean {
-  const clean = upperText
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[¡!¿?.,]/g, '')
-    .trim();
-
+  const clean = normalizeSearchKey(upperText);
   return [
     'PEDIR TAXI',
     'NECESITO UN TAXI',
@@ -163,8 +251,133 @@ function isInvalidNameInput(text: string): boolean {
     'SI',
     'NO',
     'ACEPTO',
+    'COTIZAR',
   ];
-  return blockedWords.includes(clean.toUpperCase());
+  return blockedWords.includes(normalizeSearchKey(clean));
+}
+
+function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const toRad = (v: number) => (v * Math.PI) / 180;
+  const R = 6371000;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+async function resolvePlaceToCoords(rawPlace: string): Promise<GeoPoint | null> {
+  const cleanKey = normalizeSearchKey(rawPlace);
+  if (!cleanKey || cleanKey.length < 3) return null;
+
+  for (const lm of KNOWN_LANDMARKS) {
+    if (lm.keys.some((k) => cleanKey === k || cleanKey.includes(k))) {
+      return { lat: lm.lat, lng: lm.lng, label: lm.label };
+    }
+  }
+
+  try {
+    const query = `${rawPlace.trim()}, Caldas, Antioquia, Colombia`;
+    const res = await axios.get('https://nominatim.openstreetmap.org/search', {
+      params: {
+        q: query,
+        format: 'json',
+        limit: 1,
+        countrycodes: 'co',
+      },
+      headers: { 'User-Agent': 'TaxiCaldasDispatch/1.0' },
+      timeout: 4500,
+    });
+
+    if (Array.isArray(res.data) && res.data.length > 0) {
+      const hit = res.data[0];
+      const shortName = String(hit.display_name || rawPlace)
+        .split(',')
+        .slice(0, 2)
+        .join(',')
+        .trim();
+      return {
+        lat: Number(hit.lat),
+        lng: Number(hit.lon),
+        label: shortName || rawPlace.trim(),
+      };
+    }
+
+    // Segundo intento en todo el Valle de Aburrá / Antioquia
+    const fallbackRes = await axios.get('https://nominatim.openstreetmap.org/search', {
+      params: {
+        q: `${rawPlace.trim()}, Antioquia, Colombia`,
+        format: 'json',
+        limit: 1,
+        countrycodes: 'co',
+      },
+      headers: { 'User-Agent': 'TaxiCaldasDispatch/1.0' },
+      timeout: 4500,
+    });
+
+    if (Array.isArray(fallbackRes.data) && fallbackRes.data.length > 0) {
+      const hit = fallbackRes.data[0];
+      const shortName = String(hit.display_name || rawPlace)
+        .split(',')
+        .slice(0, 2)
+        .join(',')
+        .trim();
+      return {
+        lat: Number(hit.lat),
+        lng: Number(hit.lon),
+        label: shortName || rawPlace.trim(),
+      };
+    }
+  } catch (err) {
+    console.error('Aviso geocodificando lugar:', err);
+  }
+
+  return null;
+}
+
+async function calculateRouteQuote(
+  origin: GeoPoint,
+  destination: GeoPoint,
+  tariffs: { baseFare: number; pricePerKm: number; minFare: number }
+): Promise<{
+  distanceKm: number;
+  durationMinutes: number;
+  estimatedFare: number;
+}> {
+  let distanceMeters = 0;
+  let durationSeconds = 0;
+
+  try {
+    const url = `https://router.project-osrm.org/route/v1/driving/${origin.lng},${origin.lat};${destination.lng},${destination.lat}?overview=false`;
+    const res = await axios.get(url, { timeout: 4500 });
+    const route = res.data?.routes?.[0];
+    if (route && route.distance > 0) {
+      distanceMeters = Number(route.distance);
+      durationSeconds = Number(route.duration || 0);
+    }
+  } catch {
+    // Fallback vial urbano si OSRM no responde a tiempo
+  }
+
+  if (distanceMeters <= 0) {
+    const straight = haversineMeters(
+      origin.lat,
+      origin.lng,
+      destination.lat,
+      destination.lng
+    );
+    distanceMeters = Math.max(500, Math.round(straight * 1.35));
+    durationSeconds = Math.round(distanceMeters / 7.5);
+  }
+
+  const distanceKm = Number((distanceMeters / 1000).toFixed(1));
+  const durationMinutes = Math.max(3, Math.round(durationSeconds / 60));
+  const rawFare = tariffs.baseFare + distanceKm * tariffs.pricePerKm;
+  const roundedFare = Math.round(rawFare / 100) * 100;
+  const estimatedFare = Math.max(tariffs.minFare, roundedFare);
+
+  return { distanceKm, durationMinutes, estimatedFare };
 }
 
 function calculateEtaEstimate(distanceMeters: number | null | undefined): {
@@ -210,14 +423,27 @@ async function getRuntimeConfig() {
     const tripCommission = Number(
       map.trip_commission || process.env.TRIP_COMMISSION || 500
     );
+    const baseFare = Number(map.base_fare || 5900);
+    const pricePerKm = Number(map.price_per_km || 2400);
+    const minFare = Number(map.min_fare || 8300);
 
-    return { centralPhone, adminPhones, tripCommission };
+    return {
+      centralPhone,
+      adminPhones,
+      tripCommission,
+      baseFare,
+      pricePerKm,
+      minFare,
+    };
   } catch {
     const centralPhone = process.env.CENTRAL_PHONE || '573133336835';
     return {
       centralPhone,
       adminPhones: [centralPhone],
       tripCommission: Number(process.env.TRIP_COMMISSION || 500),
+      baseFare: 5900,
+      pricePerKm: 2400,
+      minFare: 8300,
     };
   }
 }
@@ -250,31 +476,52 @@ async function findAvailableDriversInRadius(
 
 async function broadcastTripOffer(
   drivers: Array<{ id: number; phone: string; distance_meters: string | number }>,
-  tripId: number,
+  tripInfo: {
+    id: number;
+    dropoffAddress?: string | null;
+    distanceKm?: number | null;
+    estimatedFare?: number | null;
+  },
   tripCommission: number,
   isExpandedRing = false
 ) {
   const header = isExpandedRing
-    ? '🚨 *NUEVO SERVICIO (ZONA AMPLIADA)*'
-    : '🚨 *NUEVO SERVICIO DISPONIBLE*';
+    ? '🚖 *CENTRAL TAXI CALDAS • NUEVO SERVICIO (ZONA AMPLIADA)*'
+    : '🚖 *CENTRAL TAXI CALDAS • NUEVO SERVICIO DISPONIBLE*';
+
+  const routeDetails =
+    tripInfo.dropoffAddress && tripInfo.estimatedFare
+      ? `\n🏁 *Destino (B):* ${tripInfo.dropoffAddress}` +
+        `\n🛣️ *Recorrido aprox.:* ${tripInfo.distanceKm} km` +
+        `\n💵 *Valor aproximado servicio:* *${formatCOP(tripInfo.estimatedFare)}*`
+      : `\n🏁 *Destino (B):* Por confirmar con el usuario`;
 
   for (const drv of drivers) {
     const currentTrip = await db.query(`SELECT status FROM trips WHERE id = $1`, [
-      tripId,
+      tripInfo.id,
     ]);
     if (currentTrip.rows[0]?.status !== 'SEARCHING') break;
 
-    await redis.set(`offer:${drv.phone}`, tripId, 'EX', 120);
+    await redis.set(`offer:${drv.phone}`, tripInfo.id, 'EX', 120);
     await sendText(
       drv.phone,
-      `${header}\n📍 Distancia aproximada: *${drv.distance_meters} metros*\n💸 Comisión: *${formatCOP(tripCommission)}*\n\nResponde *1* o *YO* para tomarlo.`
+      `${header}\n\n` +
+        `📍 *Recogida (A):* a *${drv.distance_meters} metros* de ti` +
+        `${routeDetails}\n` +
+        `💸 *Comisión central:* ${formatCOP(tripCommission)}\n\n` +
+        `Responde *1* o *YO* para tomarlo.`
     );
     await new Promise((r) => setTimeout(r, 600));
   }
 }
 
 function scheduleExpandedSearch(
-  tripId: number,
+  tripInfo: {
+    id: number;
+    dropoffAddress?: string | null;
+    distanceKm?: number | null;
+    estimatedFare?: number | null;
+  },
   passengerPhone: string,
   passengerName: string | null,
   lng: number,
@@ -287,7 +534,7 @@ function scheduleExpandedSearch(
   setTimeout(async () => {
     try {
       const check = await db.query(`SELECT status FROM trips WHERE id = $1`, [
-        tripId,
+        tripInfo.id,
       ]);
       if (check.rows[0]?.status !== 'SEARCHING') return;
 
@@ -303,17 +550,17 @@ function scheduleExpandedSearch(
       if (extraDrivers.length > 0) {
         await sendText(
           passengerPhone,
-          `🔎 Seguimos buscando tu taxi${nameTag}. Ampliamos el radio a *5 km* y acabamos de alertar a *${extraDrivers.length} conductores* adicionales...`
+          `🚖 *CENTRAL TAXI CALDAS:*\n🔎 Seguimos buscando tu taxi${nameTag}. Ampliamos el radio a *5 km* y acabamos de alertar a *${extraDrivers.length} conductores* adicionales...`
         );
-        await broadcastTripOffer(extraDrivers, tripId, tripCommission, true);
+        await broadcastTripOffer(extraDrivers, tripInfo, tripCommission, true);
       } else if (initialAlertedIds.length > 0) {
         await sendText(
           passengerPhone,
-          `⏳ Seguimos esperando confirmación de los conductores cercanos a tu zona${nameTag}...\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
+          `🚖 *CENTRAL TAXI CALDAS:*\n⏳ Seguimos esperando confirmación de los conductores cercanos a tu zona${nameTag}...\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
         );
       }
     } catch (err) {
-      console.error(`Error en expansión de radio viaje #${tripId}:`, err);
+      console.error(`Error en expansión de radio viaje #${tripInfo.id}:`, err);
     }
   }, EXPAND_DELAY_MS);
 
@@ -324,23 +571,217 @@ function scheduleExpandedSearch(
          SET status = 'CANCELLED', cancelled_by = 'TIMEOUT', cancelled_at = NOW()
          WHERE id = $1 AND status = 'SEARCHING'
          RETURNING id`,
-        [tripId]
+        [tripInfo.id]
       );
       if (expired.rows.length > 0) {
         await sendText(
           passengerPhone,
-          `😔 Lo sentimos${nameTag}, ningún conductor pudo tomar tu solicitud en este momento. Por favor envíanos nuevamente tu *ubicación actual* para intentar de nuevo.`
+          `🚖 *CENTRAL TAXI CALDAS:*\n😔 Lo sentimos${nameTag}, ningún conductor pudo tomar tu solicitud en este momento. Por favor envíanos nuevamente tu *ubicación actual* para intentar de nuevo.`
         );
       }
     } catch (err) {
-      console.error(`Error cerrando timeout viaje #${tripId}:`, err);
+      console.error(`Error cerrando timeout viaje #${tripInfo.id}:`, err);
     }
   }, FINAL_TIMEOUT_MS);
+}
+
+async function dispatchTripFromPickup(params: {
+  passengerPhone: string;
+  passengerName: string | null;
+  pickup: GeoPoint;
+  dropoff?: GeoPoint | null;
+  distanceKm?: number | null;
+  estimatedFare?: number | null;
+  tripCommission: number;
+}) {
+  const {
+    passengerPhone,
+    passengerName,
+    pickup,
+    dropoff,
+    distanceKm,
+    estimatedFare,
+    tripCommission,
+  } = params;
+
+  const existingCheck = await db.query(
+    `SELECT id FROM trips WHERE passenger_phone = $1 AND status IN ('SEARCHING', 'ACTIVE') LIMIT 1`,
+    [passengerPhone]
+  );
+  if (existingCheck.rows.length > 0) return;
+
+  const reqLock = await redis.set(
+    `passenger:req_lock:${passengerPhone}`,
+    '1',
+    'EX',
+    5,
+    'NX'
+  );
+  if (!reqLock) return;
+
+  let nearbyDrivers = await findAvailableDriversInRadius(
+    pickup.lng,
+    pickup.lat,
+    INITIAL_RADIUS_METERS,
+    tripCommission,
+    [],
+    passengerPhone
+  );
+  let usedExpandedImmediately = false;
+
+  if (nearbyDrivers.length === 0) {
+    nearbyDrivers = await findAvailableDriversInRadius(
+      pickup.lng,
+      pickup.lat,
+      EXPANDED_RADIUS_METERS,
+      tripCommission,
+      [],
+      passengerPhone
+    );
+    usedExpandedImmediately = true;
+  }
+
+  if (nearbyDrivers.length === 0) {
+    await sendText(
+      passengerPhone,
+      `🚖 *CENTRAL TAXI CALDAS:*\n😔 Lo sentimos${passengerName ? ` *${passengerName}*` : ''}, no encontramos taxis disponibles a menos de 5 km de tu ubicación en este momento. Intenta nuevamente en un par de minutos.`
+    );
+    return;
+  }
+
+  let tripId: number;
+  try {
+    const newTrip = await db.query(
+      `INSERT INTO trips (
+         passenger_phone, pickup_location, pickup_address,
+         dropoff_location, dropoff_address, distance_km, estimated_fare
+       )
+       VALUES (
+         $1,
+         ST_SetSRID(ST_MakePoint($2, $3), 4326)::geography,
+         $4,
+         CASE WHEN $5::double precision IS NOT NULL AND $6::double precision IS NOT NULL
+              THEN ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography
+              ELSE NULL END,
+         $7,
+         $8,
+         $9
+       )
+       RETURNING id`,
+      [
+        passengerPhone,
+        pickup.lng,
+        pickup.lat,
+        pickup.label,
+        dropoff ? dropoff.lng : null,
+        dropoff ? dropoff.lat : null,
+        dropoff ? dropoff.label : null,
+        distanceKm ?? null,
+        estimatedFare ?? null,
+      ]
+    );
+    tripId = newTrip.rows[0].id;
+    await db.query(
+      `UPDATE passengers SET trips_count = trips_count + 1 WHERE phone = $1`,
+      [passengerPhone]
+    );
+  } catch (insertErr: any) {
+    if (insertErr?.code === '23505') return;
+    throw insertErr;
+  }
+
+  const greetingPrefix = passengerName
+    ? `🚖 *CENTRAL TAXI CALDAS:*\n🔎 ¡Listo *${passengerName}*! Solicitud *#${tripId}* creada.`
+    : `🚖 *CENTRAL TAXI CALDAS:*\n🔎 Solicitud *#${tripId}* creada.`;
+
+  const fareLine =
+    dropoff && estimatedFare
+      ? `\n🏁 *Destino (B):* ${dropoff.label}\n💵 *Valor aproximado:* *${formatCOP(estimatedFare)}* (${distanceKm} km)`
+      : '';
+
+  await sendText(
+    passengerPhone,
+    usedExpandedImmediately
+      ? `${greetingPrefix}${fareLine}\n\nEstamos alertando a *${nearbyDrivers.length} conductores* en un radio de *5 km*...\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
+      : `${greetingPrefix}${fareLine}\n\nEstamos alertando a *${nearbyDrivers.length} conductores* cercanos a tu zona...\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
+  );
+
+  const tripInfo = {
+    id: tripId,
+    dropoffAddress: dropoff?.label || null,
+    distanceKm: distanceKm ?? null,
+    estimatedFare: estimatedFare ?? null,
+  };
+
+  await broadcastTripOffer(
+    nearbyDrivers,
+    tripInfo,
+    tripCommission,
+    usedExpandedImmediately
+  );
+
+  const alertedIds = nearbyDrivers.map((d) => d.id);
+  scheduleExpandedSearch(
+    tripInfo,
+    passengerPhone,
+    passengerName,
+    pickup.lng,
+    pickup.lat,
+    tripCommission,
+    alertedIds
+  );
 }
 
 app.get(['/', '/health'], (_req, res) =>
   res.json({ ok: true, service: 'taxi-caldas-backend' })
 );
+
+// Endpoint interno para que el operador de Central Taxi Caldas envíe mensajes en un viaje
+app.post('/admin/send-trip-message', async (req, res) => {
+  try {
+    const { tripId, target, message } = req.body;
+    const numericId = Number(tripId);
+    const cleanMsg = String(message || '').trim();
+
+    if (!numericId || !cleanMsg) {
+      res.status(400).json({ error: 'Falta viaje o mensaje' });
+      return;
+    }
+
+    const tripRes = await db.query(
+      `SELECT t.id, t.passenger_phone, d.phone AS driver_phone
+       FROM trips t
+       LEFT JOIN drivers d ON t.driver_id = d.id
+       WHERE t.id = $1`,
+      [numericId]
+    );
+    const trip = tripRes.rows[0];
+    if (!trip) {
+      res.status(404).json({ error: 'Viaje no encontrado' });
+      return;
+    }
+
+    const formatted = `🚖 *CENTRAL TAXI CALDAS:* ${cleanMsg}`;
+
+    if ((target === 'PASSENGER' || target === 'BOTH') && trip.passenger_phone) {
+      await sendText(trip.passenger_phone, formatted);
+    }
+    if ((target === 'DRIVER' || target === 'BOTH') && trip.driver_phone) {
+      await sendText(trip.driver_phone, formatted);
+    }
+
+    await db.query(
+      `INSERT INTO chat_logs (trip_id, sender_role, sender_phone, receiver_phone, message_type, content)
+       VALUES ($1, 'CENTRAL', 'CENTRAL_ADMIN', $2, 'TEXT', $3)`,
+      [numericId, target || 'BOTH', cleanMsg]
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Error en /admin/send-trip-message:', err);
+    res.status(500).json({ error: 'Error enviando mensaje de central' });
+  }
+});
 
 // Endpoint interno para borrar perfiles (conductores o clientes) y limpiar sesiones Redis
 app.post('/admin/delete-profile', async (req, res) => {
@@ -367,7 +808,9 @@ app.post('/admin/delete-profile', async (req, res) => {
         `offer:${drv.phone}`,
         `session:${drv.phone}`,
         `driver_passenger_mode:${drv.phone}`,
-        `role_confirm:${drv.phone}`
+        `role_confirm:${drv.phone}`,
+        `quote:${drv.phone}`,
+        `pending_pickup:${drv.phone}`
       );
 
       for (const fileRel of [drv.profile_photo_path, drv.doc_photo_path]) {
@@ -407,7 +850,9 @@ app.post('/admin/delete-profile', async (req, res) => {
       `ask_name:${pass.phone}`,
       `rate:${pass.phone}`,
       `session:${pass.phone}`,
-      `role_confirm:${pass.phone}`
+      `role_confirm:${pass.phone}`,
+      `quote:${pass.phone}`,
+      `pending_pickup:${pass.phone}`
     );
     await db.query(`DELETE FROM passengers WHERE id = $1`, [numericId]);
 
@@ -523,7 +968,7 @@ app.post('/public/driver-register', async (req, res) => {
     try {
       await sendText(
         cleanPhone,
-        `✅ *¡Solicitud recibida en Taxi Caldas, ${formattedName}!*\n\n🔢 Placa: *${cleanPlate}*\n🚕 Vehículo: *${cleanModel}*\n📋 Habeas Data: *Autorizado*\n\nRecibimos tu formulario web con foto de perfil y documentos. Te avisaremos por aquí en cuanto tu cuenta sea aprobada.`
+        `🚖 *CENTRAL TAXI CALDAS:*\n✅ *¡Solicitud recibida, ${formattedName}!*\n\n🔢 Placa: *${cleanPlate}*\n🚕 Vehículo: *${cleanModel}*\n📋 Habeas Data: *Autorizado*\n\nRecibimos tu formulario web con foto de perfil y documentos. Te avisaremos por aquí en cuanto tu cuenta sea aprobada.`
       );
     } catch (e) {
       console.error('Aviso enviando confirmación WhatsApp web register:', e);
@@ -532,7 +977,7 @@ app.post('/public/driver-register', async (req, res) => {
     const adminPhone = adminPhones[0];
     if (adminPhone) {
       try {
-        const summary = `🌐🆕 *NUEVO TAXISTA REGISTRADO POR WEB*\n\n👤 Nombre: *${formattedName}*\n📱 Teléfono: *${cleanPhone}*\n🔢 Placa: *${cleanPlate}*\n🚕 Vehículo: *${cleanModel}*\n\nPara aprobarlo responde:\n*/aprobar ${cleanPlate} 5000*`;
+        const summary = `🚖 *CENTRAL TAXI CALDAS • NUEVO TAXISTA (WEB)*\n\n👤 Nombre: *${formattedName}*\n📱 Teléfono: *${cleanPhone}*\n🔢 Placa: *${cleanPlate}*\n🚕 Vehículo: *${cleanModel}*\n\nPara aprobarlo responde:\n*/aprobar ${cleanPlate} 5000*`;
         await sendMedia(
           adminPhone,
           'image',
@@ -599,8 +1044,14 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
     const docMsg = msg.documentMessage;
     const pushName: string | null = data.pushName || null;
 
-    const { centralPhone, adminPhones, tripCommission } =
-      await getRuntimeConfig();
+    const {
+      centralPhone,
+      adminPhones,
+      tripCommission,
+      baseFare,
+      pricePerKm,
+      minFare,
+    } = await getRuntimeConfig();
 
     const isFromMe = Boolean(data.key?.fromMe);
     const isAdmin = adminPhones.includes(from.replace('@lid', ''));
@@ -622,7 +1073,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           `SELECT id, full_name, plate, vehicle_model, phone FROM drivers WHERE approval_status = 'PENDING' ORDER BY created_at ASC`
         );
         if (pending.rows.length === 0) {
-          await sendText(from, '✅ No hay conductores pendientes por aprobar.');
+          await sendText(from, '🚖 *CENTRAL TAXI CALDAS:*\n✅ No hay conductores pendientes por aprobar.');
           return;
         }
         const list = pending.rows
@@ -633,7 +1084,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           .join('\n');
         await sendText(
           from,
-          `📋 *Conductores pendientes:*\n\n${list}\n\nPara aprobar escribe:\n*/aprobar PLACA BONO*\nEj: /aprobar ${pending.rows[0].plate} 5000`
+          `🚖 *CENTRAL TAXI CALDAS • PENDIENTES:*\n\n${list}\n\nPara aprobar escribe:\n*/aprobar PLACA BONO*\nEj: /aprobar ${pending.rows[0].plate} 5000`
         );
         return;
       }
@@ -645,7 +1096,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         if (!plate) {
           await sendText(
             from,
-            '⚠️ Uso correcto: */aprobar PLACA [BONO_INICIAL]*\nEj: /aprobar ABC-123 5000'
+            '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ Uso correcto: */aprobar PLACA [BONO_INICIAL]*\nEj: /aprobar ABC-123 5000'
           );
           return;
         }
@@ -661,7 +1112,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         if (drvRes.rows.length === 0) {
           await sendText(
             from,
-            `❌ No se encontró ningún conductor con placa *${plate}*.`
+            `🚖 *CENTRAL TAXI CALDAS:*\n❌ No se encontró ningún conductor con placa *${plate}*.`
           );
           return;
         }
@@ -676,11 +1127,11 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
         await sendText(
           from,
-          `✅ Conductor *${drv.full_name}* (*${drv.plate}*) aprobado.\n💰 Saldo actual: *${formatCOP(drv.balance)}*`
+          `🚖 *CENTRAL TAXI CALDAS:*\n✅ Conductor *${drv.full_name}* (*${drv.plate}*) aprobado.\n💰 Saldo actual: *${formatCOP(drv.balance)}*`
         );
         await sendText(
           drv.phone,
-          `🎉 *¡Tu cuenta en Taxi Caldas ha sido aprobada, ${drv.full_name}!*\n\n🚕 Placa: *${drv.plate}*\n💰 Saldo disponible: *${formatCOP(drv.balance)}*\n\nPara empezar a recibir carreras, envía tu *ubicación actual* (📎 -> Ubicación).`
+          `🚖 *CENTRAL TAXI CALDAS:*\n🎉 *¡Tu cuenta ha sido aprobada, ${drv.full_name}!*\n\n🚕 Placa: *${drv.plate}*\n💰 Saldo disponible: *${formatCOP(drv.balance)}*\n\nPara empezar a recibir carreras, envía tu *ubicación actual* (📎 -> Ubicación).`
         );
         return;
       }
@@ -692,7 +1143,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         if (!plate || isNaN(amount) || amount <= 0) {
           await sendText(
             from,
-            '⚠️ Uso correcto: */recargar PLACA MONTO*\nEj: /recargar ABC-123 20000'
+            '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ Uso correcto: */recargar PLACA MONTO*\nEj: /recargar ABC-123 20000'
           );
           return;
         }
@@ -705,7 +1156,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         if (drvRes.rows.length === 0) {
           await sendText(
             from,
-            `❌ No se encontró ningún conductor con placa *${plate}*.`
+            `🚖 *CENTRAL TAXI CALDAS:*\n❌ No se encontró ningún conductor con placa *${plate}*.`
           );
           return;
         }
@@ -718,17 +1169,17 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
         await sendText(
           from,
-          `✅ Recarga exitosa de *${formatCOP(amount)}* a *${drv.full_name}* (*${drv.plate}*).\n💰 Nuevo saldo: *${formatCOP(drv.balance)}*`
+          `🚖 *CENTRAL TAXI CALDAS:*\n✅ Recarga exitosa de *${formatCOP(amount)}* a *${drv.full_name}* (*${drv.plate}*).\n💰 Nuevo saldo: *${formatCOP(drv.balance)}*`
         );
         await sendText(
           drv.phone,
-          `💳 *¡Recarga acreditada en Taxi Caldas, ${drv.full_name}!*\n\n➕ Valor recargado: *${formatCOP(amount)}*\n💰 Nuevo saldo disponible: *${formatCOP(drv.balance)}*\n\nEnvía tu *ubicación* (📎 -> Ubicación) o escribe *ACTIVO* para recibir servicios.`
+          `🚖 *CENTRAL TAXI CALDAS:*\n💳 *¡Recarga acreditada, ${drv.full_name}!*\n\n➕ Valor recargado: *${formatCOP(amount)}*\n💰 Nuevo saldo disponible: *${formatCOP(drv.balance)}*\n\nEnvía tu *ubicación* (📎 -> Ubicación) o escribe *ACTIVO* para recibir servicios.`
         );
         return;
       }
     }
 
-    // 1. MODO PROXY ENMASCARADO (VIAJE ACTIVO)
+    // 1. MODO PROXY ENMASCARADO (VIAJE ACTIVO) CON TÍTULOS EXPLÍCITOS
     const activeSessionRaw = await redis.get(`session:${from}`);
     if (activeSessionRaw) {
       const session = JSON.parse(activeSessionRaw);
@@ -785,15 +1236,20 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           logsRes.rows.length > 0
             ? logsRes.rows
                 .reverse()
-                .map(
-                  (l) =>
-                    `• ${l.sender_role === 'PASSENGER' ? 'Pasajero' : 'Conductor'}: ${l.content}`
-                )
+                .map((l) => {
+                  const who =
+                    l.sender_role === 'PASSENGER'
+                      ? 'USUARIO'
+                      : l.sender_role === 'DRIVER'
+                      ? 'TAXISTA'
+                      : 'CENTRAL TAXI CALDAS';
+                  return `• ${who}: ${l.content}`;
+                })
                 .join('\n')
             : 'Sin mensajes previos.';
 
         const whoLabel =
-          session.role === 'PASSENGER' ? '👤 PASAJERO' : '🚕 CONDUCTOR';
+          session.role === 'PASSENGER' ? '👤 USUARIO' : '🚕 TAXISTA';
         const pickupMap = info?.pickup_lat
           ? `https://maps.google.com/?q=${info.pickup_lat},${info.pickup_lng}`
           : 'No disponible';
@@ -802,12 +1258,12 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           : 'No disponible';
 
         const sosReport =
-          `🆘🚨 *ALERTA DE EMERGENCIA SOS - TAXI CALDAS* 🚨🆘\n\n` +
+          `🚖 *CENTRAL TAXI CALDAS • ALERTA SOS* 🆘\n\n` +
           `Activada por: *${whoLabel}* (*${from}*)\n` +
           `Servicio ID: *#${session.tripId}*\n\n` +
           `🚕 *Vehículo:* ${info?.vehicle_model || 'N/A'} | Placa: *${info?.driver_plate || 'N/A'}*\n` +
-          `👨‍✈️ *Conductor:* ${info?.driver_name || 'N/A'} (Tel: ${info?.driver_phone || 'N/A'})\n` +
-          `🙋 *Pasajero:* ${info?.passenger_name || 'Sin nombre'} (${info?.passenger_phone || 'N/A'})\n\n` +
+          `👨‍✈️ *Taxista:* ${info?.driver_name || 'N/A'} (Tel: ${info?.driver_phone || 'N/A'})\n` +
+          `🙋 *Usuario:* ${info?.passenger_name || 'Sin nombre'} (${info?.passenger_phone || 'N/A'})\n\n` +
           `📍 *Punto de recogida:* ${pickupMap}\n` +
           `🛰️ *Último GPS taxi:* ${driverMap}\n\n` +
           `💬 *Últimos mensajes del chat:*\n${recentChat}`;
@@ -818,7 +1274,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
         await sendText(
           from,
-          '🆘 *Alerta SOS recibida por la Central Taxi Caldas.*\nYa notificamos de inmediato al equipo de monitoreo con los datos del vehículo, ubicación GPS y registro del viaje.'
+          '🚖 *CENTRAL TAXI CALDAS:*\n🆘 *Alerta SOS recibida.* Ya notificamos de inmediato al equipo de monitoreo con los datos del vehículo, ubicación GPS y registro del viaje.'
         );
         return;
       }
@@ -865,11 +1321,11 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
           await sendText(
             from,
-            '❌ *Has cancelado tu servicio.* Si necesitas otro taxi, envíanos tu ubicación.'
+            '🚖 *CENTRAL TAXI CALDAS:*\n❌ *Has cancelado tu servicio.* Si necesitas un taxi más adelante, envíanos tu ubicación.'
           );
           await sendText(
             session.peerPhone,
-            `⚠️ *El pasajero canceló el servicio.*\n💸 Se reembolsaron *+${formatCOP(tripCommission)}* a tu billetera (Saldo: *${formatCOP(refundedDriver?.balance || 0)}*).\n🟢 Quedas *DISPONIBLE* para nuevas carreras.`
+            `🚖 *CENTRAL TAXI CALDAS:*\n⚠️ *El usuario canceló el servicio.*\n💸 Se reembolsaron *+${formatCOP(tripCommission)}* a tu billetera (Saldo: *${formatCOP(refundedDriver?.balance || 0)}*).\n🟢 Quedas *DISPONIBLE* para nuevas carreras.`
           );
         } else {
           await db.query(
@@ -882,11 +1338,11 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
           await sendText(
             from,
-            '❌ *Has cancelado el servicio.* Quedas *DISPONIBLE* para nuevas carreras.'
+            '🚖 *CENTRAL TAXI CALDAS:*\n❌ *Has cancelado el servicio.* Quedas *DISPONIBLE* para nuevas carreras.'
           );
           await sendText(
             session.peerPhone,
-            '⚠️ *El conductor canceló el servicio.* Disculpa las molestias.\n\nSi aún necesitas taxi, envíanos nuevamente tu *ubicación actual* (📎 -> Ubicación) para asignarte otro vehículo.'
+            '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ *El taxista canceló el servicio.* Disculpa las molestias.\n\nSi aún necesitas taxi, envíanos nuevamente tu *ubicación actual* (📎 -> Ubicación) para asignarte otro vehículo.'
           );
         }
         return;
@@ -925,27 +1381,32 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
         await sendText(
           from,
-          '✅ Servicio finalizado. Quedas *DISPONIBLE* para nuevas carreras.'
+          '🚖 *CENTRAL TAXI CALDAS:*\n✅ Servicio finalizado. Quedas *DISPONIBLE* para nuevas carreras.'
         );
         await sendText(
           session.peerPhone,
-          `🏁 *¡Tu viaje ha finalizado!*\n\n¿Cómo calificarías el servicio de *${drv?.full_name || 'tu conductor'}* (*${drv?.plate || ''}*)?\n\nResponde con un número del *1* al *5*:\n⭐⭐⭐⭐⭐ *5* - Excelente\n⭐⭐⭐⭐ *4* - Muy bueno\n⭐⭐⭐ *3* - Regular\n⭐⭐ *2* - Malo\n⭐ *1* - Muy malo\n\n_(O escribe *OMITIR* para saltar)_`
+          `🚖 *CENTRAL TAXI CALDAS:*\n🏁 *¡Tu viaje ha finalizado!*\n\n¿Cómo calificarías el servicio de *${drv?.full_name || 'tu taxista'}* (*${drv?.plate || ''}*)?\n\nResponde con un número del *1* al *5*:\n⭐⭐⭐⭐⭐ *5* - Excelente\n⭐⭐⭐⭐ *4* - Muy bueno\n⭐⭐⭐ *3* - Regular\n⭐⭐ *2* - Malo\n⭐ *1* - Muy malo\n\n_(O escribe *OMITIR* para saltar)_`
         );
         return;
       }
 
-      const prefix =
-        session.role === 'PASSENGER' ? '👤 *Pasajero:*' : '🚕 *Conductor:*';
+      // Título explícito: 👤 USUARIO vs 🚕 TAXISTA
+      const roleTitle =
+        session.role === 'PASSENGER'
+          ? `👤 *USUARIO${session.senderName ? ` (${session.senderName})` : ''}:*`
+          : `🚕 *TAXISTA${session.senderName ? ` (${session.senderName})` : ''}:*`;
 
       if (text) {
-        await sendText(session.peerPhone, `${prefix} ${text}`);
+        await sendText(session.peerPhone, `${roleTitle}\n${text}`);
         await db.query(
           `INSERT INTO chat_logs (trip_id, sender_role, sender_phone, receiver_phone, message_type, content) VALUES ($1, $2, $3, $4, 'TEXT', $5)`,
           [session.tripId, session.role, from, session.peerPhone, text]
         );
       } else if (imageMsg) {
         const media = await getMediaBase64(data);
-        const caption = imageMsg.caption ? `${prefix} ${imageMsg.caption}` : prefix;
+        const caption = imageMsg.caption
+          ? `${roleTitle}\n${imageMsg.caption}`
+          : roleTitle;
         await sendMedia(
           session.peerPhone,
           'image',
@@ -965,7 +1426,9 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         );
       } else if (videoMsg) {
         const media = await getMediaBase64(data);
-        const caption = videoMsg.caption ? `${prefix} ${videoMsg.caption}` : prefix;
+        const caption = videoMsg.caption
+          ? `${roleTitle}\n${videoMsg.caption}`
+          : roleTitle;
         await sendMedia(
           session.peerPhone,
           'video',
@@ -985,17 +1448,19 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         );
       } else if (audioMsg) {
         const media = await getMediaBase64(data);
+        await sendText(session.peerPhone, `${roleTitle} 🎤 _Nota de voz:_`);
         await sendAudio(session.peerPhone, media.base64);
         await db.query(
           `INSERT INTO chat_logs (trip_id, sender_role, sender_phone, receiver_phone, message_type, content) VALUES ($1, $2, $3, $4, 'AUDIO', '[Nota de voz]')`,
           [session.tripId, session.role, from, session.peerPhone]
         );
       } else if (location) {
+        await sendText(session.peerPhone, `${roleTitle} 📍 _Ubicación en tiempo real:_`);
         await sendLocation(
           session.peerPhone,
           location.degreesLatitude,
           location.degreesLongitude,
-          'Ubicación actualizada'
+          session.role === 'PASSENGER' ? 'Ubicación del Usuario' : 'Ubicación del Taxista'
         );
         await db.query(
           `INSERT INTO chat_logs (trip_id, sender_role, sender_phone, receiver_phone, message_type, content) VALUES ($1, $2, $3, $4, 'LOCATION', $5)`,
@@ -1020,7 +1485,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         await redis.del(`rate:${from}`);
         await sendText(
           from,
-          '👌 Calificación omitida. Cuando necesites otro taxi, envíanos tu ubicación.'
+          '🚖 *CENTRAL TAXI CALDAS:*\n👌 Calificación omitida. Cuando necesites otro taxi, envíanos tu ubicación o escribe *COTIZAR*.'
         );
         return;
       } else {
@@ -1045,14 +1510,14 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           await redis.del(`rate:${from}`);
           await sendText(
             from,
-            `🙏 *¡Gracias por tu calificación de ${score}/5!*\nTu opinión nos ayuda a mantener el mejor servicio en *Taxi Caldas*.`
+            `🚖 *CENTRAL TAXI CALDAS:*\n🙏 *¡Gracias por tu calificación de ${score}/5!*\nTu opinión nos ayuda a mantener el mejor servicio.`
           );
 
           const updatedDrv = drvUpdate.rows[0];
           if (updatedDrv) {
             await sendText(
               updatedDrv.phone,
-              `⭐ *¡Recibiste una calificación de ${score}/5!*\nTu promedio actual es *${updatedDrv.rating_avg} ⭐* (${updatedDrv.rating_count} viajes calificados).`
+              `🚖 *CENTRAL TAXI CALDAS:*\n⭐ *¡Recibiste una calificación de ${score}/5!*\nTu promedio actual es *${updatedDrv.rating_avg} ⭐* (${updatedDrv.rating_count} viajes calificados).`
             );
           }
 
@@ -1060,19 +1525,19 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
             for (const adminPhone of adminPhones) {
               await sendText(
                 adminPhone,
-                `⚠️ *ALERTA DE CALIFICACIÓN BAJA (${score}/5)*\n\n🚕 Conductor: *${rateState.driverName}* (*${rateState.plate}*)\n🧾 Viaje ID: *#${rateState.tripId}*\n👤 Pasajero: *${from}*`
+                `🚖 *CENTRAL TAXI CALDAS • CALIFICACIÓN BAJA (${score}/5)*\n\n🚕 Taxista: *${rateState.driverName}* (*${rateState.plate}*)\n🧾 Viaje ID: *#${rateState.tripId}*\n👤 Usuario: *${from}*`
               );
             }
           }
           return;
         }
 
-        if (/HOLA|TAXI|NECESITO|SERVICIO|PIDO/i.test(upperText)) {
+        if (/HOLA|TAXI|NECESITO|SERVICIO|PIDO|COTIZAR/i.test(upperText)) {
           await redis.del(`rate:${from}`);
         } else {
           await sendText(
             from,
-            '⭐ Por favor responde con un número del *1* al *5* para calificar tu último viaje, o escribe *OMITIR*.'
+            '🚖 *CENTRAL TAXI CALDAS:*\n⭐ Por favor responde con un número del *1* al *5* para calificar tu último viaje, o escribe *OMITIR*.'
           );
           return;
         }
@@ -1096,10 +1561,10 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         isDriverInPassengerMode &&
         (cmd === 'MODO CONDUCTOR' || cmd === 'VOLVER A CONDUCTOR')
       ) {
-        await redis.del(`driver_passenger_mode:${from}`);
+        await redis.del(`driver_passenger_mode:${from}`, `quote:${from}`, `pending_pickup:${from}`);
         await sendText(
           from,
-          `🚕 *Modo Conductor activado nuevamente, ${driver.full_name}.*\nEnvía tu *ubicación* (📎 -> Ubicación) o escribe *ACTIVO* para recibir servicios.`
+          `🚖 *CENTRAL TAXI CALDAS:*\n🚕 *Modo Taxista activado nuevamente, ${driver.full_name}.*\nEnvía tu *ubicación* (📎 -> Ubicación) o escribe *ACTIVO* para recibir servicios.`
         );
         return;
       }
@@ -1111,12 +1576,11 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         await redis.set(`driver_passenger_mode:${from}`, '1', 'EX', 7200);
         await sendText(
           from,
-          `🙋 *Modo Pasajero activado, ${driver.full_name}.* Tu turno como conductor quedó en pausa.\n\n📍 Envíame la *ubicación GPS* (📎 -> Ubicación) donde necesitas que te recoja un taxi.\n_(Cuando termines, escribe *MODO CONDUCTOR* para volver a operar)_`
+          `🚖 *CENTRAL TAXI CALDAS:*\n🙋 *Modo Usuario activado, ${driver.full_name}.* Tu turno como taxista quedó en pausa.\n\n📍 Envíame tu *ubicación GPS* (📎 -> Ubicación) para pedir un taxi, o escribe *COTIZAR* para calcular un viaje de un punto A a un punto B.\n_(Cuando termines, escribe *MODO CONDUCTOR* para volver a operar)_`
         );
         return;
       }
 
-      // Si el conductor NO está en modo pasajero ni tiene un viaje de pasajero buscando, atender comandos de conductor
       const activePassengerTrip = await db.query(
         `SELECT id FROM trips WHERE passenger_phone = $1 AND status IN ('SEARCHING', 'ACTIVE') LIMIT 1`,
         [from]
@@ -1126,7 +1590,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         if (!driver.is_verified || driver.approval_status !== 'APPROVED') {
           await sendText(
             from,
-            `⏳ Hola *${driver.full_name}*, tu registro para el vehículo *${driver.plate}* está en revisión. Te avisaremos por aquí en cuanto sea aprobado.\n\n_(Si necesitas pedir un taxi como pasajero, escribe *PEDIR TAXI*)_`
+            `🚖 *CENTRAL TAXI CALDAS:*\n⏳ Hola *${driver.full_name}*, tu registro para el vehículo *${driver.plate}* está en revisión. Te avisaremos por aquí en cuanto sea aprobado.\n\n_(Si necesitas pedir un taxi como usuario, escribe *PEDIR TAXI*)_`
           );
           return;
         }
@@ -1152,7 +1616,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
           await sendText(
             from,
-            `💰 *Tu Billetera Prepago, ${driver.full_name}*\n\nSaldo actual: *${formatCOP(driver.balance)}*\nCalificación: *${driver.rating_avg || '5.00'} ⭐*\nComisión por servicio: *${formatCOP(tripCommission)}*\n\n*Últimos movimientos:*\n${history}\n\nPara recargar, transfiere vía Nequi/Llave al *${centralPhone.replace(/^57/, '')}* indicando tu placa *${driver.plate}*.`
+            `🚖 *CENTRAL TAXI CALDAS • BILLETERA*\n\n👨‍✈️ Taxista: *${driver.full_name}*\n💰 Saldo actual: *${formatCOP(driver.balance)}*\n⭐ Calificación: *${driver.rating_avg || '5.00'}*\n💸 Comisión por servicio: *${formatCOP(tripCommission)}*\n\n*Últimos movimientos:*\n${history}\n\nPara recargar, transfiere vía Nequi/Llave al *${centralPhone.replace(/^57/, '')}* indicando tu placa *${driver.plate}*.`
           );
           return;
         }
@@ -1163,7 +1627,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           ]);
           await sendText(
             from,
-            `🔴 Turno pausado, *${driver.full_name}*. Escribe *ACTIVO* o envía tu ubicación cuando vuelvas a operar.`
+            `🚖 *CENTRAL TAXI CALDAS:*\n🔴 Turno pausado, *${driver.full_name}*. Escribe *ACTIVO* o envía tu ubicación cuando vuelvas a operar.`
           );
           return;
         }
@@ -1172,7 +1636,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           if (driver.balance < tripCommission) {
             await sendText(
               from,
-              `⚠️ *Saldo insuficiente para operar*\n\nTu saldo actual es *${formatCOP(driver.balance)}* y el mínimo requerido por carrera es *${formatCOP(tripCommission)}*.\n\nRecarga tu cuenta vía Nequi/Llave al *${centralPhone.replace(/^57/, '')}* enviando tu placa *${driver.plate}*.`
+              `🚖 *CENTRAL TAXI CALDAS:*\n⚠️ *Saldo insuficiente para operar*\n\nTu saldo actual es *${formatCOP(driver.balance)}* y el mínimo requerido por carrera es *${formatCOP(tripCommission)}*.\n\nRecarga tu cuenta vía Nequi/Llave al *${centralPhone.replace(/^57/, '')}* enviando tu placa *${driver.plate}*.`
             );
             return;
           }
@@ -1184,7 +1648,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           ]);
           await sendText(
             from,
-            `🟢 Estás *DISPONIBLE*, *${driver.full_name}* (Saldo: *${formatCOP(driver.balance)}*).\nEnvíame tu ubicación actual (📎 -> Ubicación) para recibir servicios cercanos.`
+            `🚖 *CENTRAL TAXI CALDAS:*\n🟢 Estás *DISPONIBLE*, *${driver.full_name}* (Saldo: *${formatCOP(driver.balance)}*).\nEnvíame tu ubicación actual (📎 -> Ubicación) para recibir servicios cercanos.`
           );
           return;
         }
@@ -1196,7 +1660,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           );
           await sendText(
             from,
-            `📍 Ubicación GPS actualizada, *${driver.full_name}* (Saldo: *${formatCOP(driver.balance)}*). Buscando pasajeros cerca de ti...`
+            `🚖 *CENTRAL TAXI CALDAS:*\n📍 Ubicación GPS actualizada, *${driver.full_name}* (Saldo: *${formatCOP(driver.balance)}*). Buscando pasajeros cerca de ti...`
           );
           return;
         }
@@ -1206,7 +1670,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           if (driver.balance < tripCommission) {
             await sendText(
               from,
-              `⚠️ No tienes saldo suficiente (*${formatCOP(driver.balance)}*) para tomar esta carrera. Escribe *SALDO* para ver cómo recargar.`
+              `🚖 *CENTRAL TAXI CALDAS:*\n⚠️ No tienes saldo suficiente (*${formatCOP(driver.balance)}*) para tomar esta carrera. Escribe *SALDO* para ver cómo recargar.`
             );
             return;
           }
@@ -1221,7 +1685,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           if (!lock) {
             await sendText(
               from,
-              '⚠️ Lo sentimos, otro conductor acaba de tomar este servicio.'
+              '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ Lo sentimos, otro taxista acaba de tomar este servicio.'
             );
             return;
           }
@@ -1244,7 +1708,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
               await redis.del(`trip:lock:${pendingTripId}`, `offer:${from}`);
               await sendText(
                 from,
-                '⚠️ Este servicio ya fue cancelado por el pasajero o tomado.'
+                '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ Este servicio ya fue cancelado por el usuario o tomado.'
               );
               return;
             }
@@ -1260,7 +1724,10 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
             if (balRes.rows.length === 0) {
               await client.query('ROLLBACK');
               await redis.del(`trip:lock:${pendingTripId}`);
-              await sendText(from, '⚠️ Saldo insuficiente para tomar el servicio.');
+              await sendText(
+                from,
+                '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ Saldo insuficiente para tomar el servicio.'
+              );
               return;
             }
 
@@ -1318,7 +1785,12 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           await redis.del(`offer:${from}`);
           await redis.set(
             `session:${trip.passenger_phone}`,
-            JSON.stringify({ tripId: trip.id, role: 'PASSENGER', peerPhone: from }),
+            JSON.stringify({
+              tripId: trip.id,
+              role: 'PASSENGER',
+              peerPhone: from,
+              senderName: passengerName || 'Cliente',
+            }),
             'EX',
             7200
           );
@@ -1328,15 +1800,23 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
               tripId: trip.id,
               role: 'DRIVER',
               peerPhone: trip.passenger_phone,
+              senderName: `${driver.full_name} • ${driver.plate}`,
             }),
             'EX',
             7200
           );
 
+          const quoteInfoForPassenger =
+            trip.dropoff_address && trip.estimated_fare
+              ? `\n🏁 *Destino (B):* ${trip.dropoff_address}\n💵 *Valor aproximado del servicio:* *${formatCOP(trip.estimated_fare)}* (${trip.distance_km} km)\n`
+              : '\n';
+
           const passengerCardText =
-            `✅ *¡Taxi asignado${passengerName ? `, ${passengerName}` : ''}!*\n\n` +
-            `⏱️ *Tiempo estimado de llegada:* *${eta.rangeText}* (${eta.distanceText})\n\n` +
-            `👨‍✈️ *Perfil del Conductor:*\n` +
+            `🚖 *CENTRAL TAXI CALDAS • TAXI ASIGNADO*\n\n` +
+            `✅ *¡Tu taxi va en camino${passengerName ? `, ${passengerName}` : ''}!*\n` +
+            `⏱️ *Tiempo estimado de llegada:* *${eta.rangeText}* (${eta.distanceText})` +
+            `${quoteInfoForPassenger}\n` +
+            `👨‍✈️ *Perfil del Taxista:*\n` +
             `• *Nombre:* ${driver.full_name}\n` +
             `• *Calificación:* ${driver.rating_avg || '5.00'} ⭐ (${driver.rating_count || 0} calif.)\n` +
             `• *Servicios completados:* ${completedTrips}\n` +
@@ -1344,7 +1824,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
             `🚕 *Datos del Vehículo:*\n` +
             `• *Vehículo:* ${driver.vehicle_model}\n` +
             `• *Placa:* *${driver.plate}*\n\n` +
-            `🔒 Tu número permanece privado. Puedes enviar mensajes, fotos o notas de voz por este chat.\n` +
+            `💬 Todo mensaje que envíes por aquí llegará identificado como *USUARIO* al taxista (tu número permanece privado).\n` +
             `• Escribe *CANCELAR* para cancelar\n` +
             `• Escribe *SOS* en caso de emergencia`;
 
@@ -1371,40 +1851,56 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
             await sendText(trip.passenger_phone, passengerCardText);
           }
 
+          const quoteInfoForDriver =
+            trip.dropoff_address && trip.estimated_fare
+              ? `\n🏁 *Destino (B):* ${trip.dropoff_address}\n💵 *Valor aproximado servicio:* *${formatCOP(trip.estimated_fare)}* (${trip.distance_km} km)`
+              : `\n🏁 *Destino (B):* Por confirmar con el usuario`;
+
           await sendText(
             from,
-            `✅ *¡Servicio asignado a ti!*\n👤 Pasajero: *${passengerName || 'Cliente Taxi Caldas'}*\n⏱️ Tiempo estimado al punto: *${eta.rangeText}*\n💸 Comisión descontada: *-${formatCOP(tripCommission)}*\n💰 Saldo restante: *${formatCOP(newBalance)}*\n\nEscribe o envía audios/fotos por aquí para hablar con el pasajero.\n• *FIN* - Terminar viaje\n• *CANCELAR* - Cancelar servicio\n• *SOS* - Emergencia`
+            `🚖 *CENTRAL TAXI CALDAS • SERVICIO ASIGNADO*\n\n` +
+              `👤 *Usuario:* ${passengerName || 'Cliente Taxi Caldas'}\n` +
+              `⏱️ *Tiempo estimado al punto A:* ${eta.rangeText}` +
+              `${quoteInfoForDriver}\n` +
+              `💸 *Comisión descontada:* -${formatCOP(tripCommission)}\n` +
+              `💰 *Saldo restante:* ${formatCOP(newBalance)}\n\n` +
+              `💬 Tus mensajes llegarán identificados como *TAXISTA* al usuario.\n` +
+              `• *FIN* - Terminar viaje\n` +
+              `• *CANCELAR* - Cancelar servicio\n` +
+              `• *SOS* - Emergencia`
           );
-          await sendLocation(from, trip.lat, trip.lng, 'Punto de recogida');
+          await sendLocation(from, trip.lat, trip.lng, 'Punto A: Recogida del Usuario');
           return;
         }
 
         await sendText(
           from,
-          `🚕 Hola *${driver.full_name}* (*${driver.plate}*) | ${driver.rating_avg || '5.00'} ⭐\n\nComandos de conductor:\n• Envía tu *ubicación* (📎 -> Ubicación) para activar turno\n• *SALDO* - Ver saldo y movimientos\n• *PAUSA* - Pausar turno\n• *PEDIR TAXI* - Cambiar a modo pasajero para pedir un taxi`
+          `🚖 *CENTRAL TAXI CALDAS*\nHola *${driver.full_name}* (*${driver.plate}*) | ${driver.rating_avg || '5.00'} ⭐\n\nComandos de taxista:\n• Envía tu *ubicación* (📎 -> Ubicación) para activar turno\n• *SALDO* - Ver saldo y movimientos\n• *PAUSA* - Pausar turno\n• *PEDIR TAXI* - Cambiar a modo usuario para pedir un taxi`
         );
         return;
       }
     }
 
-    // 3. CONFIRMACIÓN DE ROL (PASAJERO VS TAXISTA) Y AUTO-REGISTRO DE NUEVO TAXISTA
+    // 3. CONFIRMACIÓN DE ROL (USUARIO VS TAXISTA) Y AUTO-REGISTRO DE NUEVO TAXISTA
     const regRaw = await redis.get(`reg:${from}`);
 
     if (upperText === 'CANCELAR' && regRaw) {
       await redis.del(`reg:${from}`);
       await sendText(
         from,
-        '❌ Registro cancelado. Si deseas pedir un taxi, escríbenos *HOLA*.'
+        '🚖 *CENTRAL TAXI CALDAS:*\n❌ Registro cancelado. Si deseas pedir un taxi o cotizar, escríbenos *HOLA*.'
       );
       return;
     }
 
-    // Si está esperando confirmación de rol (1 = Pasajero, 2 = Taxista)
     const pendingRoleConfirm = await redis.get(`role_confirm:${from}`);
     if (pendingRoleConfirm && !regRaw) {
       if (upperText === 'CANCELAR') {
         await redis.del(`role_confirm:${from}`);
-        await sendText(from, '❌ Operación cancelada. Escríbenos *HOLA* cuando nos necesites.');
+        await sendText(
+          from,
+          '🚖 *CENTRAL TAXI CALDAS:*\n❌ Operación cancelada. Escríbenos *HOLA* cuando nos necesites.'
+        );
         return;
       }
 
@@ -1425,9 +1921,9 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         );
         await sendText(
           from,
-          '🚕 *Afiliación de Conductores - Taxi Caldas*\n\n' +
+          '🚖 *CENTRAL TAXI CALDAS • AFILIACIÓN DE TAXISTAS*\n\n' +
             '📋 *Autorización de Tratamiento de Datos (Ley 1581 de 2012):*\n' +
-            'Para validar tu identidad, vehículo, documentos, foto de perfil y ubicación GPS durante los servicios, autorizas a *Taxi Caldas* el tratamiento de tus datos personales conforme a nuestra política de privacidad. Puedes conocer, actualizar o suprimir tus datos en cualquier momento.\n\n' +
+            'Para validar tu identidad, vehículo, documentos, foto de perfil y ubicación GPS durante los servicios, autorizas a *Taxi Caldas* el tratamiento de tus datos personales conforme a nuestra política de privacidad.\n\n' +
             '👉 Responde *ACEPTO* (o *1*) para iniciar tu registro, o *CANCELAR* para salir.'
         );
         return;
@@ -1442,26 +1938,24 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         Boolean(location)
       ) {
         await redis.del(`role_confirm:${from}`);
-        // Continúa hacia el flujo de Pasajero (sección 4)
       } else {
         await sendText(
           from,
-          '🚕 Por favor confírmame con un número qué deseas hacer:\n\n' +
-            '*1* 👉 Soy *PASAJERO* (quiero pedir un taxi)\n' +
-            '*2* 👉 Soy *CONDUCTOR / TAXISTA* (quiero registrar mi vehículo)'
+          '🚖 *CENTRAL TAXI CALDAS:*\nPor favor confírmame con un número qué deseas hacer:\n\n' +
+            '*1* 👉 Soy *USUARIO* (quiero pedir o cotizar un taxi)\n' +
+            '*2* 👉 Soy *TAXISTA / CONDUCTOR* (quiero registrar mi vehículo)'
         );
         return;
       }
     }
 
-    // Detectar palabras clave de taxi/taxista/registro y pedir confirmación previa
     if (!regRaw && !registeredDriver && isAmbiguousTaxiOrDriverIntent(upperText)) {
       await redis.set(`role_confirm:${from}`, '1', 'EX', 1800);
       await sendText(
         from,
-        '🚕 ¡Hola! Para atenderte correctamente en *Taxi Caldas*, confírmame por favor qué deseas hacer:\n\n' +
-          '*1* 👉 Soy *PASAJERO* (quiero pedir un taxi)\n' +
-          '*2* 👉 Soy *CONDUCTOR / TAXISTA* (quiero registrar mi vehículo para trabajar)\n\n' +
+        '🚖 *CENTRAL TAXI CALDAS:*\n¡Hola! Para atenderte correctamente, confírmame por favor qué deseas hacer:\n\n' +
+          '*1* 👉 Soy *USUARIO* (quiero pedir o cotizar un taxi)\n' +
+          '*2* 👉 Soy *TAXISTA / CONDUCTOR* (quiero registrar mi vehículo para trabajar)\n\n' +
           'Responde *1* o *2*.'
       );
       return;
@@ -1475,14 +1969,14 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           await redis.del(`reg:${from}`);
           await sendText(
             from,
-            'ℹ️ Entendido. Sin autorización de tratamiento de datos no podemos registrar tu perfil de conductor en *Taxi Caldas*.'
+            '🚖 *CENTRAL TAXI CALDAS:*\nℹ️ Entendido. Sin autorización de tratamiento de datos no podemos registrar tu perfil de taxista.'
           );
           return;
         }
         if (!isConsentAccepted(upperText)) {
           await sendText(
             from,
-            '📋 Por favor responde *ACEPTO* (o *1*) para autorizar el tratamiento de tus datos personales y continuar con tu registro, o escribe *CANCELAR*.'
+            '🚖 *CENTRAL TAXI CALDAS:*\n📋 Por favor responde *ACEPTO* (o *1*) para autorizar el tratamiento de tus datos personales y continuar con tu registro, o escribe *CANCELAR*.'
           );
           return;
         }
@@ -1493,7 +1987,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         await redis.set(`reg:${from}`, JSON.stringify(regState), 'EX', 1800);
         await sendText(
           from,
-          '✅ *Autorización registrada.*\n\nVamos a completar tu perfil en 5 pasos rápidos:\n1️⃣ Por favor escribe tu *nombre y apellido*:'
+          '🚖 *CENTRAL TAXI CALDAS:*\n✅ *Autorización registrada.*\n\nCompletemos tu perfil en 5 pasos rápidos:\n1️⃣ Por favor escribe tu *nombre y apellido*:'
         );
         return;
       }
@@ -1502,7 +1996,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         if (text.length < 3) {
           await sendText(
             from,
-            '⚠️ Por favor escribe tu nombre completo (mínimo 3 letras):'
+            '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ Por favor escribe tu nombre completo (mínimo 3 letras):'
           );
           return;
         }
@@ -1511,7 +2005,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         await redis.set(`reg:${from}`, JSON.stringify(regState), 'EX', 1800);
         await sendText(
           from,
-          `2️⃣ Gracias *${regState.fullName}*. Ahora escribe la *placa* de tu taxi (Ej: *WXY-123*):`
+          `🚖 *CENTRAL TAXI CALDAS:*\n2️⃣ Gracias *${regState.fullName}*. Ahora escribe la *placa* de tu taxi (Ej: *WXY-123*):`
         );
         return;
       }
@@ -1521,7 +2015,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         if (cleanPlate.length < 5) {
           await sendText(
             from,
-            '⚠️ Placa no válida. Escríbela nuevamente (Ej: *WXY-123*):'
+            '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ Placa no válida. Escríbela nuevamente (Ej: *WXY-123*):'
           );
           return;
         }
@@ -1532,7 +2026,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         if (exists.rows.length > 0) {
           await sendText(
             from,
-            `⚠️ La placa *${cleanPlate}* ya está registrada. Escribe otra placa o *CANCELAR*:`
+            `🚖 *CENTRAL TAXI CALDAS:*\n⚠️ La placa *${cleanPlate}* ya está registrada. Escribe otra placa o *CANCELAR*:`
           );
           return;
         }
@@ -1541,7 +2035,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         await redis.set(`reg:${from}`, JSON.stringify(regState), 'EX', 1800);
         await sendText(
           from,
-          '3️⃣ Escribe la *marca, línea y color* del vehículo (Ej: *Kia Picanto Amarillo*):'
+          '🚖 *CENTRAL TAXI CALDAS:*\n3️⃣ Escribe la *marca, línea y color* del vehículo (Ej: *Kia Picanto Amarillo*):'
         );
         return;
       }
@@ -1550,7 +2044,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         if (text.length < 3) {
           await sendText(
             from,
-            '⚠️ Indica el modelo y color del vehículo (Ej: *Hyundai i10 Amarillo*):'
+            '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ Indica el modelo y color del vehículo (Ej: *Hyundai i10 Amarillo*):'
           );
           return;
         }
@@ -1559,7 +2053,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         await redis.set(`reg:${from}`, JSON.stringify(regState), 'EX', 1800);
         await sendText(
           from,
-          '4️⃣ Ahora envía una *foto tipo selfie clara de tu rostro* (📎 -> Cámara o Galería).\n_Esta foto será mostrada a los pasajeros cuando aceptes un servicio para su seguridad._'
+          '🚖 *CENTRAL TAXI CALDAS:*\n4️⃣ Ahora envía una *foto tipo selfie clara de tu rostro* (📎 -> Cámara o Galería).\n_Esta foto será mostrada a los usuarios cuando aceptes un servicio._'
         );
         return;
       }
@@ -1568,7 +2062,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         if (!imageMsg) {
           await sendText(
             from,
-            '🤳 Por favor adjunta una *foto de tu rostro* (imagen) para tu perfil de conductor, o escribe *CANCELAR*:'
+            '🚖 *CENTRAL TAXI CALDAS:*\n🤳 Por favor adjunta una *foto de tu rostro* (imagen) para tu perfil de taxista, o escribe *CANCELAR*:'
           );
           return;
         }
@@ -1586,7 +2080,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         await redis.set(`reg:${from}`, JSON.stringify(regState), 'EX', 1800);
         await sendText(
           from,
-          '5️⃣ ¡Foto de perfil guardada! Por último, envía una *foto clara de tu Tarjetón / Licencia de conducción o Tarjeta de Propiedad* (📎 -> Cámara o Galería):'
+          '🚖 *CENTRAL TAXI CALDAS:*\n5️⃣ ¡Foto de perfil guardada! Por último, envía una *foto clara de tu Tarjetón / Licencia de conducción o Tarjeta de Propiedad* (📎 -> Cámara o Galería):'
         );
         return;
       }
@@ -1595,7 +2089,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         if (!imageMsg && !docMsg) {
           await sendText(
             from,
-            '📸 Por favor adjunta una *foto* de tus documentos (no texto) para completar el registro, o escribe *CANCELAR*:'
+            '🚖 *CENTRAL TAXI CALDAS:*\n📸 Por favor adjunta una *foto* de tus documentos (no texto) para completar el registro, o escribe *CANCELAR*:'
           );
           return;
         }
@@ -1631,12 +2125,12 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
         await sendText(
           from,
-          `✅ *¡Solicitud de registro completada, ${regState.fullName}!*\n\n🔢 Placa: *${regState.plate}*\n🚕 Vehículo: *${regState.vehicleModel}*\n📋 Habeas Data: *Autorizado*\n\nValidaremos tu foto de perfil y documentos, y te activaremos por este mismo chat.`
+          `🚖 *CENTRAL TAXI CALDAS:*\n✅ *¡Solicitud de registro completada, ${regState.fullName}!*\n\n🔢 Placa: *${regState.plate}*\n🚕 Vehículo: *${regState.vehicleModel}*\n📋 Habeas Data: *Autorizado*\n\nValidaremos tu foto de perfil y documentos, y te activaremos por este mismo chat.`
         );
 
         const adminPhone = adminPhones[0];
         if (adminPhone) {
-          const summary = `🆕 *NUEVO TAXISTA REGISTRADO*\n\n👤 Nombre: *${regState.fullName}*\n📱 Teléfono: *${from}*\n🔢 Placa: *${regState.plate}*\n🚕 Vehículo: *${regState.vehicleModel}*\n\nPara aprobarlo y darle saldo inicial responde:\n*/aprobar ${regState.plate} 5000*`;
+          const summary = `🚖 *CENTRAL TAXI CALDAS • NUEVO TAXISTA*\n\n👤 Nombre: *${regState.fullName}*\n📱 Teléfono: *${from}*\n🔢 Placa: *${regState.plate}*\n🚕 Vehículo: *${regState.vehicleModel}*\n\nPara aprobarlo y darle saldo inicial responde:\n*/aprobar ${regState.plate} 5000*`;
           if (imageMsg) {
             await sendMedia(
               adminPhone,
@@ -1653,8 +2147,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       }
     }
 
-    // 4. VERIFICACIÓN PREVIA DE HABEAS DATA (LEY 1581 DE 2012) PARA CLIENTES / PASAJEROS
-    // (Si es un taxista en modo pasajero, ya aceptó Habeas Data al afiliarse y usa su propio nombre)
+    // 4. VERIFICACIÓN PREVIA DE HABEAS DATA (LEY 1581 DE 2012) PARA USUARIOS
     let passenger: any = null;
     if (registeredDriver && isDriverInPassengerMode) {
       passenger = {
@@ -1670,10 +2163,10 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
       if (upperText === 'ELIMINAR MIS DATOS' || upperText === 'REVOCAR DATOS') {
         await db.query(`DELETE FROM passengers WHERE phone = $1`, [from]);
-        await redis.del(`consent_pending:${from}`, `ask_name:${from}`);
+        await redis.del(`consent_pending:${from}`, `ask_name:${from}`, `quote:${from}`, `pending_pickup:${from}`);
         await sendText(
           from,
-          '🗑️ Tus datos personales han sido eliminados de nuestra base de datos conforme a la Ley 1581 de 2012. Si deseas volver a usar *Taxi Caldas* más adelante, escríbenos *HOLA*.'
+          '🚖 *CENTRAL TAXI CALDAS:*\n🗑️ Tus datos personales han sido eliminados de nuestra base de datos conforme a la Ley 1581 de 2012. Si deseas volver a usar el servicio más adelante, escríbenos *HOLA*.'
         );
         return;
       }
@@ -1692,7 +2185,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
             );
             await sendText(
               from,
-              '🚕 *Afiliación de Conductores - Taxi Caldas*\n\n' +
+              '🚖 *CENTRAL TAXI CALDAS • AFILIACIÓN DE TAXISTAS*\n\n' +
                 '📋 *Autorización de Tratamiento de Datos (Ley 1581 de 2012):*\n' +
                 'Para validar tu identidad, vehículo, documentos, foto de perfil y ubicación GPS durante los servicios, autorizas a *Taxi Caldas* el tratamiento de tus datos personales conforme a nuestra política de privacidad.\n\n' +
                 '👉 Responde *ACEPTO* (o *1*) para iniciar tu registro.'
@@ -1704,7 +2197,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
             await redis.del(`consent_pending:${from}`);
             await sendText(
               from,
-              'ℹ️ Entendido. Sin tu autorización de tratamiento de datos no podemos registrar tu perfil ni gestionar servicios en *Taxi Caldas*. Cuando desees autorizar, escríbenos *HOLA*.'
+              '🚖 *CENTRAL TAXI CALDAS:*\nℹ️ Entendido. Sin tu autorización de tratamiento de datos no podemos registrar tu perfil ni gestionar servicios. Cuando desees autorizar, escríbenos *HOLA*.'
             );
             return;
           }
@@ -1728,14 +2221,14 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
               await redis.set(`ask_name:${from}`, '1', 'EX', 3600);
               await sendText(
                 from,
-                '✅ *¡Autorización registrada!* Gracias por confiar en *Taxi Caldas*.\n\nPara brindarte una atención personalizada, ¿cuál es tu *nombre y apellido*? 😊'
+                '🚖 *CENTRAL TAXI CALDAS:*\n✅ *¡Autorización registrada!* Gracias por confiar en nosotros.\n\nPara brindarte una atención personalizada, ¿cuál es tu *nombre y apellido*? 😊'
               );
               return;
             }
           } else {
             await sendText(
               from,
-              '📋 Para continuar en *Taxi Caldas* y cumplir con la Ley 1581 de 2012 (Habeas Data), por favor responde *ACEPTO* (o *1*) autorizando el tratamiento de tus datos personales para pedir tu taxi.'
+              '🚖 *CENTRAL TAXI CALDAS:*\n📋 Para continuar y cumplir con la Ley 1581 de 2012 (Habeas Data), por favor responde *ACEPTO* (o *1*) autorizando el tratamiento de tus datos personales para pedir o cotizar tu taxi.'
             );
             return;
           }
@@ -1743,11 +2236,11 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           await redis.set(`consent_pending:${from}`, '1', 'EX', 3600);
           await sendText(
             from,
-            '👋 ¡Hola! Bienvenido a *Taxi Caldas*.\n\n' +
+            '🚖 *CENTRAL TAXI CALDAS*\n¡Hola! Bienvenido.\n\n' +
               '📋 *Aviso de Protección de Datos (Ley 1581 de 2012):*\n' +
-              'Para gestionar tu solicitud de taxi, seguridad GPS e historial de viajes, autorizas a *Taxi Caldas* el tratamiento de tus datos personales conforme a nuestra política de privacidad. Podrás conocer, actualizar o suprimir tus datos en cualquier momento.\n\n' +
-              '👉 Responde *ACEPTO* (o *1*) para pedir un taxi.\n' +
-              '🚕 Si eres conductor y deseas registrar tu vehículo, responde *2* o escribe *SOY TAXISTA*.'
+              'Para gestionar tu solicitud de taxi, cotizaciones, seguridad GPS e historial de viajes, autorizas a *Taxi Caldas* el tratamiento de tus datos personales conforme a nuestra política de privacidad.\n\n' +
+              '👉 Responde *ACEPTO* (o *1*) para continuar.\n' +
+              '🚕 Si eres taxista y deseas registrar tu vehículo, responde *2* o escribe *SOY TAXISTA*.'
           );
           return;
         }
@@ -1765,7 +2258,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
     const passengerName: string | null = passenger?.full_name || null;
 
     if (upperText === 'CANCELAR') {
-      await redis.del(`ask_name:${from}`);
+      await redis.del(`ask_name:${from}`, `quote:${from}`, `pending_pickup:${from}`);
       const searchingTrip = await db.query(
         `UPDATE trips
          SET status = 'CANCELLED', cancelled_by = 'PASSENGER', cancelled_at = NOW()
@@ -1780,18 +2273,18 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       if (searchingTrip.rows.length > 0) {
         await sendText(
           from,
-          `❌ Hemos cancelado tu búsqueda de taxi${passengerName ? `, *${passengerName}*` : ''}.`
+          `🚖 *CENTRAL TAXI CALDAS:*\n❌ Hemos cancelado tu búsqueda de taxi${passengerName ? `, *${passengerName}*` : ''}.`
         );
       } else {
         await sendText(
           from,
-          `ℹ️ No tienes ningún servicio activo para cancelar${passengerName ? `, *${passengerName}*` : ''}. Envía tu *ubicación actual* para pedir un taxi.`
+          `🚖 *CENTRAL TAXI CALDAS:*\nℹ️ Operación cancelada${passengerName ? `, *${passengerName}*` : ''}. Envía tu *ubicación actual* para pedir un taxi o escribe *COTIZAR* para calcular el valor de un viaje.`
         );
       }
       return;
     }
 
-    // Verificar si el pasajero ya tiene una búsqueda o viaje activo
+    // Verificar si el usuario ya tiene una búsqueda o viaje activo
     const existingTripRes = await db.query(
       `SELECT t.id, t.status, d.plate AS driver_plate, d.full_name AS driver_name, d.phone AS driver_phone
        FROM trips t
@@ -1812,6 +2305,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
             tripId: existing.id,
             role: 'PASSENGER',
             peerPhone: existing.driver_phone,
+            senderName: passengerName || 'Cliente',
           }),
           'EX',
           7200
@@ -1822,13 +2316,14 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
             tripId: existing.id,
             role: 'DRIVER',
             peerPhone: from,
+            senderName: `${existing.driver_name} • ${existing.driver_plate}`,
           }),
           'EX',
           7200
         );
         await sendText(
           from,
-          `🚕 ${passengerName ? `*${passengerName}*, ya` : 'Ya'} tienes un taxi asignado en curso (*${existing.driver_plate}* - ${existing.driver_name}).\nPuedes escribirle directamente por aquí o enviar *CANCELAR* si deseas anularlo.`
+          `🚖 *CENTRAL TAXI CALDAS:*\n🚕 ${passengerName ? `*${passengerName}*, ya` : 'Ya'} tienes un taxi asignado en curso (*${existing.driver_plate}* - ${existing.driver_name}).\nPuedes escribirle directamente por aquí (tus mensajes le llegarán como *USUARIO*) o enviar *CANCELAR*.`
         );
         return;
       }
@@ -1836,120 +2331,280 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       if (location) {
         await sendText(
           from,
-          `⏳ *Ya tienes una solicitud de taxi en curso (Servicio #${existing.id})${passengerName ? `, ${passengerName}` : ''}.*\nEstamos alertando a los conductores cercanos. Por favor espera un momento o escribe *CANCELAR* si deseas anularla antes de pedir otro.`
+          `🚖 *CENTRAL TAXI CALDAS:*\n⏳ *Ya tienes una solicitud de taxi en curso (Servicio #${existing.id})${passengerName ? `, ${passengerName}` : ''}.*\nEstamos alertando a los taxistas cercanos. Espera un momento o escribe *CANCELAR* para detenerla.`
         );
       } else {
         await sendText(
           from,
-          `⏳ Seguimos buscando un taxi cercano para tu solicitud *#${existing.id}*${passengerName ? `, *${passengerName}*` : ''}. Te avisaremos apenas un conductor acepte.\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
+          `🚖 *CENTRAL TAXI CALDAS:*\n⏳ Seguimos buscando un taxista cercano para tu solicitud *#${existing.id}*${passengerName ? `, *${passengerName}*` : ''}.\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
         );
       }
       return;
     }
 
-    // Si envía ubicación GPS: despachar de inmediato
-    if (location) {
-      await redis.del(`ask_name:${from}`);
+    // 5. FLUJO DE COTIZACIÓN DE PUNTO A A PUNTO B (Y PEDIDO DIRECTO)
+    const quoteRaw = await redis.get(`quote:${from}`);
+    const pendingPickupRaw = await redis.get(`pending_pickup:${from}`);
 
-      const reqLock = await redis.set(
-        `passenger:req_lock:${from}`,
-        '1',
+    // Si el usuario inicia manualmente COTIZAR
+    if (isQuoteIntent(upperText)) {
+      await redis.del(`ask_name:${from}`, `pending_pickup:${from}`);
+      await redis.set(
+        `quote:${from}`,
+        JSON.stringify({ step: 'ASK_ORIGIN' }),
         'EX',
-        5,
-        'NX'
+        1800
       );
-      if (!reqLock) {
-        await sendText(from, '⏳ Procesando tu ubicación, un momento por favor...');
-        return;
-      }
-
-      const lat = location.degreesLatitude;
-      const lng = location.degreesLongitude;
-
-      let nearbyDrivers = await findAvailableDriversInRadius(
-        lng,
-        lat,
-        INITIAL_RADIUS_METERS,
-        tripCommission,
-        [],
-        from
+      await sendText(
+        from,
+        `🚖 *CENTRAL TAXI CALDAS • COTIZADOR DE SERVICIO*\n\n` +
+          `1️⃣ Envía el *Punto A (Origen)*:\n` +
+          `• Comparte tu *ubicación GPS* (📎 -> Ubicación)\n` +
+          `• O escribe el *lugar/barrio de salida* (ej: _Parque Principal de Caldas_, _La Variante_)\n\n` +
+          `_(Escribe *CANCELAR* en cualquier momento para salir)_`
       );
-      let usedExpandedImmediately = false;
+      return;
+    }
 
-      if (nearbyDrivers.length === 0) {
-        nearbyDrivers = await findAvailableDriversInRadius(
-          lng,
-          lat,
-          EXPANDED_RADIUS_METERS,
-          tripCommission,
-          [],
-          from
-        );
-        usedExpandedImmediately = true;
-      }
+    // Si está dentro del flujo guiado de cotización (ASK_ORIGIN -> ASK_DESTINATION -> CONFIRM_QUOTE)
+    if (quoteRaw) {
+      const qState = JSON.parse(quoteRaw);
 
-      if (nearbyDrivers.length === 0) {
-        await sendText(
-          from,
-          `😔 Lo sentimos${passengerName ? ` *${passengerName}*` : ''}, no encontramos taxis disponibles a menos de 5 km de tu ubicación en este momento. Intenta nuevamente en un par de minutos.`
-        );
-        return;
-      }
+      if (qState.step === 'ASK_ORIGIN') {
+        let originPoint: GeoPoint | null = null;
+        if (location) {
+          originPoint = {
+            lat: location.degreesLatitude,
+            lng: location.degreesLongitude,
+            label: 'Ubicación GPS compartida (Origen)',
+          };
+        } else if (text) {
+          originPoint = await resolvePlaceToCoords(text);
+        }
 
-      let tripId: number;
-      try {
-        const newTrip = await db.query(
-          `INSERT INTO trips (passenger_phone, pickup_location) VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326)::geography) RETURNING id`,
-          [from, lng, lat]
-        );
-        tripId = newTrip.rows[0].id;
-        await db.query(
-          `UPDATE passengers SET trips_count = trips_count + 1 WHERE phone = $1`,
-          [from]
-        );
-      } catch (insertErr: any) {
-        if (insertErr?.code === '23505') {
+        if (!originPoint) {
           await sendText(
             from,
-            '⏳ Ya tienes una solicitud de taxi activa en este momento. Escribe *CANCELAR* si deseas detenerla.'
+            '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ No logré ubicar ese punto de salida. Por favor comparte el *pin de ubicación GPS* (📎 -> Ubicación) o escribe un lugar conocido (ej: _Parque de Caldas_, _La Miel_, _Mayorca_).'
           );
           return;
         }
-        throw insertErr;
+
+        qState.origin = originPoint;
+        qState.step = 'ASK_DESTINATION';
+        await redis.set(`quote:${from}`, JSON.stringify(qState), 'EX', 1800);
+        await sendText(
+          from,
+          `🚖 *CENTRAL TAXI CALDAS • COTIZADOR*\n\n` +
+            `✅ *Punto A (Origen):* ${originPoint.label}\n\n` +
+            `2️⃣ Ahora envía el *Punto B (Destino)*:\n` +
+            `• Comparte el *pin GPS del destino* (📎 -> Ubicación)\n` +
+            `• O escribe el *lugar/barrio de destino* (ej: _Centro Comercial Mayorca_, _Estación La Estrella_, _El Poblado_)`
+        );
+        return;
       }
 
-      const greetingPrefix = passengerName
-        ? `🔎 ¡Listo *${passengerName}*! Ubicación recibida.`
-        : '🔎 Ubicación recibida.';
+      if (qState.step === 'ASK_DESTINATION') {
+        let destPoint: GeoPoint | null = null;
+        if (location) {
+          destPoint = {
+            lat: location.degreesLatitude,
+            lng: location.degreesLongitude,
+            label: 'Ubicación GPS de destino',
+          };
+        } else if (text) {
+          destPoint = await resolvePlaceToCoords(text);
+        }
+
+        if (!destPoint) {
+          await sendText(
+            from,
+            '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ No logré ubicar ese destino. Envía el *pin GPS del destino* (📎 -> Ubicación) o escribe el nombre del lugar/barrio (ej: _Mayorca_, _Envigado_, _Parque de Caldas_).'
+          );
+          return;
+        }
+
+        const routeQuote = await calculateRouteQuote(qState.origin, destPoint, {
+          baseFare,
+          pricePerKm,
+          minFare,
+        });
+
+        qState.destination = destPoint;
+        qState.distanceKm = routeQuote.distanceKm;
+        qState.durationMinutes = routeQuote.durationMinutes;
+        qState.estimatedFare = routeQuote.estimatedFare;
+        qState.step = 'CONFIRM_QUOTE';
+        await redis.set(`quote:${from}`, JSON.stringify(qState), 'EX', 1800);
+
+        await sendText(
+          from,
+          `🚖 *CENTRAL TAXI CALDAS • COTIZACIÓN ESTIMADA*\n\n` +
+            `📍 *Origen (A):* ${qState.origin.label}\n` +
+            `🏁 *Destino (B):* ${destPoint.label}\n` +
+            `🛣️ *Distancia estimada:* ${routeQuote.distanceKm} km (~${routeQuote.durationMinutes} min)\n` +
+            `💵 *Valor aproximado del servicio:* *${formatCOP(routeQuote.estimatedFare)}*\n\n` +
+            `👉 Responde *1* o *PEDIR* para solicitar el taxi ahora mismo con este destino y tarifa.\n` +
+            `_(O escribe *COTIZAR* para calcular otra ruta, o *CANCELAR* para salir)_`
+        );
+        return;
+      }
+
+      if (qState.step === 'CONFIRM_QUOTE') {
+        if (
+          upperText === '1' ||
+          upperText === 'PEDIR' ||
+          upperText === 'SI' ||
+          upperText === 'SÍ' ||
+          upperText === 'CONFIRMAR' ||
+          upperText === 'SOLICITAR'
+        ) {
+          await redis.del(`quote:${from}`);
+          await dispatchTripFromPickup({
+            passengerPhone: from,
+            passengerName,
+            pickup: qState.origin,
+            dropoff: qState.destination,
+            distanceKm: qState.distanceKm,
+            estimatedFare: qState.estimatedFare,
+            tripCommission,
+          });
+          return;
+        }
+
+        await sendText(
+          from,
+          `🚖 *CENTRAL TAXI CALDAS:*\n💵 Tu cotización de *${qState.origin.label}* a *${qState.destination.label}* es de *${formatCOP(qState.estimatedFare)}*.\n\nResponde *1* o *PEDIR* para enviar un taxista, *COTIZAR* para cambiar de ruta, o *CANCELAR*.`
+        );
+        return;
+      }
+    }
+
+    // Si el usuario había enviado Punto A (GPS) y ahora responde:
+    // - "1" / "DIRECTO" / "PEDIR" -> despacha sin destino B
+    // - Otro texto o segundo GPS -> lo toma como Punto B, cotiza y pide confirmación
+    if (pendingPickupRaw) {
+      const pState = JSON.parse(pendingPickupRaw);
+      const pickupPoint: GeoPoint = pState.origin;
+
+      if (
+        upperText === '1' ||
+        upperText === 'DIRECTO' ||
+        upperText === 'PEDIR' ||
+        upperText === 'YA' ||
+        upperText === 'SIN DESTINO'
+      ) {
+        await redis.del(`pending_pickup:${from}`);
+        await dispatchTripFromPickup({
+          passengerPhone: from,
+          passengerName,
+          pickup: pickupPoint,
+          tripCommission,
+        });
+        return;
+      }
+
+      let destPoint: GeoPoint | null = null;
+      if (location) {
+        destPoint = {
+          lat: location.degreesLatitude,
+          lng: location.degreesLongitude,
+          label: 'Ubicación GPS de destino',
+        };
+      } else if (text) {
+        destPoint = await resolvePlaceToCoords(text);
+      }
+
+      if (destPoint) {
+        await redis.del(`pending_pickup:${from}`);
+        const routeQuote = await calculateRouteQuote(pickupPoint, destPoint, {
+          baseFare,
+          pricePerKm,
+          minFare,
+        });
+
+        await redis.set(
+          `quote:${from}`,
+          JSON.stringify({
+            step: 'CONFIRM_QUOTE',
+            origin: pickupPoint,
+            destination: destPoint,
+            distanceKm: routeQuote.distanceKm,
+            durationMinutes: routeQuote.durationMinutes,
+            estimatedFare: routeQuote.estimatedFare,
+          }),
+          'EX',
+          1800
+        );
+
+        await sendText(
+          from,
+          `🚖 *CENTRAL TAXI CALDAS • COTIZACIÓN ESTIMADA*\n\n` +
+            `📍 *Origen (A):* ${pickupPoint.label}\n` +
+            `🏁 *Destino (B):* ${destPoint.label}\n` +
+            `🛣️ *Distancia estimada:* ${routeQuote.distanceKm} km (~${routeQuote.durationMinutes} min)\n` +
+            `💵 *Valor aproximado del servicio:* *${formatCOP(routeQuote.estimatedFare)}*\n\n` +
+            `👉 Responde *1* o *PEDIR* para solicitar el taxi ahora mismo con este valor, o *CANCELAR* para salir.`
+        );
+        return;
+      }
 
       await sendText(
         from,
-        usedExpandedImmediately
-          ? `${greetingPrefix} Estamos alertando a *${nearbyDrivers.length} conductores* en un radio de *5 km*...\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
-          : `${greetingPrefix} Estamos alertando a *${nearbyDrivers.length} conductores* cercanos a tu zona...\n_(Escribe *CANCELAR* si deseas detener la búsqueda)_`
-      );
-
-      await broadcastTripOffer(
-        nearbyDrivers,
-        tripId,
-        tripCommission,
-        usedExpandedImmediately
-      );
-
-      const alertedIds = nearbyDrivers.map((d) => d.id);
-      scheduleExpandedSearch(
-        tripId,
-        from,
-        passengerName,
-        lng,
-        lat,
-        tripCommission,
-        alertedIds
+        '🚖 *CENTRAL TAXI CALDAS:*\n⚠️ No reconocí ese destino. Escribe un lugar/barrio conocido (ej: _Mayorca_, _Parque de Caldas_), envía el pin GPS de destino, o responde *1* para pedir el taxi directo.'
       );
       return;
     }
 
-    // 5. CAPTURA O SALUDO PERSONALIZADO POR NOMBRE PARA CLIENTES CON HABEAS DATA ACEPTADO
+    // Si envía ubicación GPS directamente (Punto A): ofrece cotizar Punto B o pedir directo (con auto-despacho a los 18s)
+    if (location) {
+      await redis.del(`ask_name:${from}`);
+      const pickupPoint: GeoPoint = {
+        lat: location.degreesLatitude,
+        lng: location.degreesLongitude,
+        label: 'Ubicación GPS compartida',
+      };
+      const token = `${Date.now()}`;
+
+      await redis.set(
+        `pending_pickup:${from}`,
+        JSON.stringify({ origin: pickupPoint, token }),
+        'EX',
+        120
+      );
+
+      await sendText(
+        from,
+        `🚖 *CENTRAL TAXI CALDAS:*\n` +
+          `📍 *Punto A (Recogida)* recibido${passengerName ? `, *${passengerName}*` : ''}.\n\n` +
+          `¿Deseas conocer el *valor aproximado* antes de pedir?\n` +
+          `• Escribe tu *destino (Punto B)* (ej: _Mayorca_, _Parque de Caldas_) o envía el *pin GPS de destino*\n` +
+          `• O responde *1* / *DIRECTO* para buscar tu taxi de inmediato.`
+      );
+
+      // Si el usuario no escribe destino en 18 segundos, despacha automáticamente para no demorarlo
+      setTimeout(async () => {
+        try {
+          const stillWaitingRaw = await redis.get(`pending_pickup:${from}`);
+          if (!stillWaitingRaw) return;
+          const stillWaiting = JSON.parse(stillWaitingRaw);
+          if (stillWaiting.token !== token) return;
+
+          await redis.del(`pending_pickup:${from}`);
+          await dispatchTripFromPickup({
+            passengerPhone: from,
+            passengerName,
+            pickup: pickupPoint,
+            tripCommission,
+          });
+        } catch (err) {
+          console.error('Error en auto-despacho pendiente:', err);
+        }
+      }, 18_000);
+      return;
+    }
+
+    // 6. CAPTURA O SALUDO PERSONALIZADO POR NOMBRE PARA USUARIOS CON HABEAS DATA ACEPTADO
     if (!passengerName) {
       const waitingName = await redis.get(`ask_name:${from}`);
 
@@ -1957,7 +2612,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         if (isInvalidNameInput(text)) {
           await sendText(
             from,
-            '😊 Para completar tu registro en *Taxi Caldas* y llamarte por tu nombre, dime por favor cómo te llamas *(Ej: Carlos Pérez)*:\n\n_(O envía directamente tu *ubicación actual* 📎 -> Ubicación si necesitas el taxi de inmediato)_'
+            '🚖 *CENTRAL TAXI CALDAS:*\n😊 Para completar tu registro y llamarte por tu nombre, dime por favor cómo te llamas *(Ej: Carlos Pérez)*:\n\n_(O envía directamente tu *ubicación actual* 📎 -> Ubicación)_'
           );
           return;
         }
@@ -1971,7 +2626,9 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
         await sendText(
           from,
-          `🙌 ¡Mucho gusto, *${formattedName}*! Ya quedaste registrado en *Taxi Caldas*.\n\n📍 Cuando necesites un servicio, solo envíame tu *ubicación actual* (📎 -> Ubicación) y te asignaremos el taxi más cercano.`
+          `🚖 *CENTRAL TAXI CALDAS:*\n🙌 ¡Mucho gusto, *${formattedName}*! Ya quedaste registrado.\n\n` +
+            `• 📍 Envía tu *ubicación actual* (📎 -> Ubicación) para pedir un taxi\n` +
+            `• 💵 O escribe *COTIZAR* para calcular el valor de un viaje de un punto A a un punto B.`
         );
         return;
       }
@@ -1979,15 +2636,17 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       await redis.set(`ask_name:${from}`, '1', 'EX', 3600);
       await sendText(
         from,
-        '😊 Para brindarte una atención personalizada en *Taxi Caldas*, ¿cuál es tu *nombre y apellido*?\n\n_(O envía directamente tu *ubicación actual* 📎 -> Ubicación si necesitas el taxi de inmediato)_'
+        '🚖 *CENTRAL TAXI CALDAS:*\n😊 Para brindarte una atención personalizada, ¿cuál es tu *nombre y apellido*?\n\n_(O envía directamente tu *ubicación actual* 📎 -> Ubicación si necesitas el taxi de inmediato)_'
       );
       return;
     }
 
-    // Cliente ya registrado escribiendo por segunda vez o más: lo saludamos por su nombre
+    // Usuario ya registrado escribiendo por segunda vez o más: lo saludamos por su nombre
     await sendText(
       from,
-      `👋 ¡Hola *${passengerName}*! Qué gusto saludarte de nuevo en *Taxi Caldas*.\n\n📍 Envíame tu *ubicación actual* (📎 -> Ubicación) para enviarte el taxi más cercano.`
+      `🚖 *CENTRAL TAXI CALDAS:*\n👋 ¡Hola *${passengerName}*! Qué gusto saludarte de nuevo.\n\n` +
+        `• 📍 Envía tu *ubicación actual* (📎 -> Ubicación) para pedir un taxi\n` +
+        `• 💵 O escribe *COTIZAR* para saber el valor aproximado de un punto A a un punto B.`
     );
   } catch (err: any) {
     console.error('❌ Error procesando webhook:', err?.response?.data || err);

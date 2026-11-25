@@ -53,6 +53,10 @@ export async function ensureDatabaseSchema(db: Pool) {
       driver_id INTEGER REFERENCES drivers(id),
       pickup_location GEOGRAPHY(Point, 4326) NOT NULL,
       pickup_address TEXT,
+      dropoff_location GEOGRAPHY(Point, 4326),
+      dropoff_address TEXT,
+      distance_km NUMERIC(6,2),
+      estimated_fare INTEGER,
       status VARCHAR(20) DEFAULT 'SEARCHING',
       rating INTEGER,
       cancelled_by VARCHAR(20),
@@ -61,6 +65,11 @@ export async function ensureDatabaseSchema(db: Pool) {
       accepted_at TIMESTAMP WITH TIME ZONE,
       completed_at TIMESTAMP WITH TIME ZONE
     );
+
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS dropoff_location GEOGRAPHY(Point, 4326);
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS dropoff_address TEXT;
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS distance_km NUMERIC(6,2);
+    ALTER TABLE trips ADD COLUMN IF NOT EXISTS estimated_fare INTEGER;
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_trip_per_passenger
     ON trips (passenger_phone)
@@ -108,8 +117,11 @@ export async function ensureDatabaseSchema(db: Pool) {
       ('central_phone', '573133336835'),
       ('admin_phones', '573133336835'),
       ('trip_commission', '500'),
+      ('base_fare', '5900'),
+      ('price_per_km', '2400'),
+      ('min_fare', '8300'),
       ('driver_invite_message', 'Hola Taxi Caldas, soy taxista y quiero registrar mi vehículo')
     ON CONFLICT (key) DO NOTHING;
   `);
-  console.log('✅ Esquema PostGIS y tablas verificadas');
+  console.log('✅ Esquema PostGIS y columnas de cotización y tarifas verificados');
 }

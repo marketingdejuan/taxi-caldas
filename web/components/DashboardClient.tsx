@@ -31,6 +31,7 @@ import {
   Trash2,
   Copy,
   Link2,
+  Send,
 } from 'lucide-react';
 
 interface Stats {
@@ -80,6 +81,9 @@ interface Trip {
   id: number;
   passenger_phone: string;
   passenger_name: string | null;
+  dropoff_address: string | null;
+  distance_km: string | number | null;
+  estimated_fare: number | null;
   status: string;
   rating: number | null;
   cancelled_by: string | null;
@@ -113,7 +117,7 @@ interface SosAlert {
 interface ChatMessage {
   id: number;
   trip_id: number;
-  sender_role: 'PASSENGER' | 'DRIVER';
+  sender_role: 'PASSENGER' | 'DRIVER' | 'CENTRAL';
   sender_phone: string;
   receiver_phone: string;
   message_type: string;
@@ -130,6 +134,9 @@ interface WhatsAppStatus {
     centralPhone: string;
     adminPhones: string;
     tripCommission: number;
+    baseFare?: number;
+    pricePerKm?: number;
+    minFare?: number;
     driverInviteMessage?: string;
   };
 }
@@ -171,6 +178,9 @@ export default function DashboardClient() {
   const [waFeedback, setWaFeedback] = useState('');
   const [adminPhonesInput, setAdminPhonesInput] = useState('');
   const [commissionInput, setCommissionInput] = useState('500');
+  const [baseFareInput, setBaseFareInput] = useState('5900');
+  const [pricePerKmInput, setPricePerKmInput] = useState('2400');
+  const [minFareInput, setMinFareInput] = useState('8300');
   const [inviteMsgInput, setInviteMsgInput] = useState(
     'Hola Taxi Caldas, soy taxista y quiero registrar mi vehículo'
   );
@@ -197,6 +207,15 @@ export default function DashboardClient() {
           if (syncInputs && data.settings) {
             setAdminPhonesInput(data.settings.adminPhones);
             setCommissionInput(String(data.settings.tripCommission));
+            if (data.settings.baseFare !== undefined) {
+              setBaseFareInput(String(data.settings.baseFare));
+            }
+            if (data.settings.pricePerKm !== undefined) {
+              setPricePerKmInput(String(data.settings.pricePerKm));
+            }
+            if (data.settings.minFare !== undefined) {
+              setMinFareInput(String(data.settings.minFare));
+            }
             if (data.settings.driverInviteMessage) {
               setInviteMsgInput(data.settings.driverInviteMessage);
             }
@@ -334,6 +353,9 @@ export default function DashboardClient() {
       id: alert.trip_id,
       passenger_phone: alert.passenger_phone || '',
       passenger_name: null,
+      dropoff_address: null,
+      distance_km: null,
+      estimated_fare: null,
       status: 'ACTIVE',
       rating: null,
       cancelled_by: null,
@@ -396,12 +418,15 @@ export default function DashboardClient() {
           action: 'SAVE_SETTINGS',
           adminPhones: adminPhonesInput,
           tripCommission: Number(commissionInput),
+          baseFare: Number(baseFareInput),
+          pricePerKm: Number(pricePerKmInput),
+          minFare: Number(minFareInput),
           driverInviteMessage: inviteMsgInput,
         }),
       });
       if (res.ok) {
         await fetchWhatsAppStatus(true);
-        setSettingsSavedMsg('Configuración guardada y aplicada al instante.');
+        setSettingsSavedMsg('Tarifas y parámetros guardados y aplicados al instante.');
         setTimeout(() => setSettingsSavedMsg(''), 4000);
       }
     } finally {
@@ -418,6 +443,21 @@ export default function DashboardClient() {
       setChatMessages(data.messages || []);
     } finally {
       setLoadingChat(false);
+    }
+  }
+
+  async function handleSendCentralMessage(
+    tripId: number,
+    target: 'BOTH' | 'PASSENGER' | 'DRIVER',
+    message: string
+  ) {
+    const res = await fetch('/api/trips/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tripId, target, message }),
+    });
+    if (res.ok && selectedTrip) {
+      await openTripChat(selectedTrip);
     }
   }
 
@@ -562,7 +602,7 @@ export default function DashboardClient() {
                   : 'text-slate-600 hover:text-slate-900'
               }`}
             >
-              <Smartphone className="h-4 w-4" /> Línea WhatsApp
+              <Smartphone className="h-4 w-4" /> Línea y Tarifas
               <span
                 className={`h-2 w-2 rounded-full ${
                   isConnected ? 'bg-emerald-500' : 'bg-red-500'
@@ -605,7 +645,7 @@ export default function DashboardClient() {
             onClick={() => setTab('WHATSAPP')}
             className="font-bold text-amber-600 underline"
           >
-            {isConnected ? 'Links / Línea' : 'Vincular QR'}
+            {isConnected ? 'Tarifas / Links' : 'Vincular QR'}
           </button>
         </div>
       </header>
@@ -617,8 +657,8 @@ export default function DashboardClient() {
             {sosAlerts.map((alert) => {
               const whoLabel =
                 alert.triggered_by === 'PASSENGER'
-                  ? '👤 PASAJERO'
-                  : '🚕 CONDUCTOR';
+                  ? '👤 USUARIO'
+                  : '🚕 TAXISTA';
               return (
                 <div
                   key={alert.id}
@@ -653,7 +693,7 @@ export default function DashboardClient() {
 
                       <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs text-red-50">
                         <span>
-                          👨‍✈️ Conductor:{' '}
+                          👨‍✈️ Taxista:{' '}
                           <strong>{alert.driver_name || 'N/A'}</strong> (
                           <span className="font-mono">
                             {alert.driver_phone || 'N/A'}
@@ -661,7 +701,7 @@ export default function DashboardClient() {
                           )
                         </span>
                         <span>
-                          🙋 Pasajero:{' '}
+                          🙋 Usuario:{' '}
                           <span className="font-mono font-bold">
                             {alert.passenger_phone || 'N/A'}
                           </span>
@@ -801,11 +841,21 @@ export default function DashboardClient() {
                       <StatusBadge status={trip.status} />
                     </div>
                     <p className="mt-1 text-xs text-slate-700 font-medium">
-                      {trip.passenger_name || 'Cliente'}{' '}
+                      {trip.passenger_name || 'Usuario'}{' '}
                       <span className="font-mono text-slate-500">
                         ({trip.passenger_phone})
                       </span>
                     </p>
+                    {trip.dropoff_address && (
+                      <p className="mt-0.5 text-[11px] text-slate-600 truncate">
+                        🏁 {trip.dropoff_address} •{' '}
+                        <strong className="text-emerald-700">
+                          {trip.estimated_fare
+                            ? `$${Number(trip.estimated_fare).toLocaleString('es-CO')}`
+                            : ''}
+                        </strong>
+                      </p>
+                    )}
                     <div className="mt-1 flex items-center justify-between text-xs text-slate-500">
                       <span>
                         {trip.driver_plate
@@ -829,10 +879,10 @@ export default function DashboardClient() {
             <div className="lg:col-span-7 rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
               <div className="border-b border-slate-100 px-4 sm:px-5 py-4">
                 <h2 className="font-bold text-slate-900">
-                  Historial de Viajes y Trazabilidad
+                  Historial de Viajes, Cotizaciones y Trazabilidad
                 </h2>
                 <p className="text-xs text-slate-500">
-                  Toca cualquier servicio para ver el chat enmascarado completo
+                  Toca cualquier servicio para ver el chat enmascarado o escribir como Central Taxi Caldas
                 </p>
               </div>
 
@@ -848,16 +898,24 @@ export default function DashboardClient() {
                       <StatusBadge status={trip.status} />
                     </div>
                     <div className="text-xs text-slate-700">
-                      <strong>{trip.passenger_name || 'Cliente'}</strong> •{' '}
+                      <strong>{trip.passenger_name || 'Usuario'}</strong> •{' '}
                       <span className="font-mono text-slate-500">
                         {trip.passenger_phone}
                       </span>
                     </div>
+                    {trip.dropoff_address && (
+                      <div className="text-xs text-slate-600">
+                        🏁 {trip.dropoff_address} ({trip.distance_km} km) •{' '}
+                        <strong className="text-emerald-700">
+                          ${Number(trip.estimated_fare || 0).toLocaleString('es-CO')}
+                        </strong>
+                      </div>
+                    )}
                     <div className="flex items-center justify-between text-xs pt-1">
                       <span className="text-slate-700 font-medium">
                         {trip.driver_plate
                           ? `🚕 ${trip.driver_plate} • ${trip.driver_name}`
-                          : 'Sin conductor'}
+                          : 'Sin taxista'}
                       </span>
                       <span className="inline-flex items-center gap-1 rounded-lg bg-blue-50 px-2.5 py-1 font-bold text-blue-700">
                         <MessageSquare className="h-3.5 w-3.5" /> {trip.message_count}
@@ -872,10 +930,10 @@ export default function DashboardClient() {
                   <thead className="bg-slate-50 text-xs uppercase text-slate-500">
                     <tr>
                       <th className="px-4 py-3">ID</th>
-                      <th className="px-4 py-3">Pasajero</th>
-                      <th className="px-4 py-3">Conductor</th>
+                      <th className="px-4 py-3">Usuario</th>
+                      <th className="px-4 py-3">Destino / Tarifa</th>
+                      <th className="px-4 py-3">Taxista</th>
                       <th className="px-4 py-3">Estado</th>
-                      <th className="px-4 py-3">Calif.</th>
                       <th className="px-4 py-3">Chat</th>
                     </tr>
                   </thead>
@@ -898,6 +956,23 @@ export default function DashboardClient() {
                           </div>
                         </td>
                         <td className="px-4 py-3 text-xs">
+                          {trip.dropoff_address ? (
+                            <>
+                              <div className="font-medium text-slate-800 max-w-[170px] truncate">
+                                {trip.dropoff_address}
+                              </div>
+                              <div className="font-bold text-emerald-700">
+                                ${Number(trip.estimated_fare || 0).toLocaleString('es-CO')}{' '}
+                                <span className="font-normal text-slate-500">
+                                  ({trip.distance_km} km)
+                                </span>
+                              </div>
+                            </>
+                          ) : (
+                            <span className="text-slate-400">Directo (sin B)</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-xs">
                           {trip.driver_plate ? (
                             <>
                               <span className="font-bold">{trip.driver_plate}</span>
@@ -912,9 +987,6 @@ export default function DashboardClient() {
                         <td className="px-4 py-3">
                           <StatusBadge status={trip.status} />
                         </td>
-                        <td className="px-4 py-3 text-xs">
-                          {trip.rating ? `${trip.rating} ⭐` : '—'}
-                        </td>
                         <td className="px-4 py-3">
                           <span className="inline-flex items-center gap-1 rounded-lg bg-blue-50 px-2.5 py-1 text-xs font-semibold text-blue-700">
                             <MessageSquare className="h-3.5 w-3.5" />{' '}
@@ -928,23 +1000,24 @@ export default function DashboardClient() {
               </div>
             </div>
 
-            <div className="hidden lg:flex lg:col-span-5 rounded-2xl border border-slate-200 bg-white shadow-sm flex-col h-[560px]">
+            <div className="hidden lg:flex lg:col-span-5 rounded-2xl border border-slate-200 bg-white shadow-sm flex-col h-[580px]">
               <ChatViewer
                 trip={selectedTrip}
                 messages={chatMessages}
                 loading={loadingChat}
+                onSendCentral={handleSendCentralMessage}
               />
             </div>
           </div>
         )}
 
-        {/* VISTA 3: BASE DE DATOS DE CLIENTES / PASAJEROS */}
+        {/* VISTA 3: BASE DE DATOS DE CLIENTES / USUARIOS */}
         {tab === 'CLIENTS' && (
           <div className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
             <div className="border-b border-slate-100 px-4 sm:px-6 py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <h2 className="font-bold text-slate-900">
-                  Base de Datos de Clientes ({passengers.length})
+                  Base de Datos de Usuarios ({passengers.length})
                 </h2>
                 <p className="text-xs text-slate-500">
                   Contactos capturados automáticamente con autorización Habeas Data
@@ -975,7 +1048,7 @@ export default function DashboardClient() {
 
             {filteredPassengers.length === 0 ? (
               <p className="p-10 text-center text-xs text-slate-500">
-                Aún no hay clientes registrados que coincidan con la búsqueda.
+                Aún no hay usuarios registrados que coincidan con la búsqueda.
               </p>
             ) : (
               <>
@@ -1019,7 +1092,7 @@ export default function DashboardClient() {
                     <thead className="bg-slate-50 text-xs uppercase text-slate-500">
                       <tr>
                         <th className="px-5 py-3">ID</th>
-                        <th className="px-5 py-3">Nombre del Cliente</th>
+                        <th className="px-5 py-3">Nombre del Usuario</th>
                         <th className="px-5 py-3">Teléfono WhatsApp</th>
                         <th className="px-5 py-3">Habeas Data</th>
                         <th className="px-5 py-3">Servicios</th>
@@ -1079,7 +1152,7 @@ export default function DashboardClient() {
                                   p.full_name || p.phone
                                 )
                               }
-                              title="Eliminar perfil de cliente"
+                              title="Eliminar perfil de usuario"
                               className="inline-flex items-center gap-1 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1 text-xs font-semibold text-red-700 hover:bg-red-100 disabled:opacity-40"
                             >
                               <Trash2 className="h-3.5 w-3.5" /> Eliminar
@@ -1228,7 +1301,7 @@ export default function DashboardClient() {
             <div className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
               <div className="border-b border-slate-100 px-4 sm:px-5 py-4">
                 <h2 className="font-bold text-slate-900">
-                  Base de Datos de Conductores y Billeteras ({approvedDrivers.length})
+                  Base de Datos de Taxistas y Billeteras ({approvedDrivers.length})
                 </h2>
               </div>
 
@@ -1300,7 +1373,7 @@ export default function DashboardClient() {
                   <thead className="bg-slate-50 text-xs uppercase text-slate-500">
                     <tr>
                       <th className="px-4 py-3">Placa</th>
-                      <th className="px-4 py-3">Conductor</th>
+                      <th className="px-4 py-3">Taxista</th>
                       <th className="px-4 py-3">Estado</th>
                       <th className="px-4 py-3">Calificación</th>
                       <th className="px-4 py-3">Saldo</th>
@@ -1374,7 +1447,7 @@ export default function DashboardClient() {
                                 `${drv.full_name} (${drv.plate})`
                               )
                             }
-                            title="Eliminar conductor"
+                            title="Eliminar taxista"
                             className="inline-flex items-center gap-1 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1 text-xs font-semibold text-red-700 hover:bg-red-100 disabled:opacity-40"
                           >
                             <Trash2 className="h-3.5 w-3.5" />
@@ -1389,7 +1462,7 @@ export default function DashboardClient() {
           </div>
         )}
 
-        {/* VISTA 5: LÍNEA WHATSAPP, ENLACES DE REGISTRO DE TAXISTAS Y PARÁMETROS */}
+        {/* VISTA 5: LÍNEA WHATSAPP, LINKS DE REGISTRO Y TARIFAS POR KILÓMETRO */}
         {tab === 'WHATSAPP' && (
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             <div className="rounded-2xl border border-slate-200 bg-white p-5 sm:p-6 shadow-sm space-y-5">
@@ -1445,7 +1518,6 @@ export default function DashboardClient() {
                   </p>
                 </div>
 
-                {/* 1. Link Formulario Web */}
                 <div className="space-y-1">
                   <label className="block text-[11px] font-bold text-slate-700">
                     1. Link directo Formulario Web (sin contraseña):
@@ -1470,7 +1542,6 @@ export default function DashboardClient() {
                   </div>
                 </div>
 
-                {/* 2. Mensaje Predeterminado + Link WhatsApp */}
                 <div className="space-y-1.5 pt-1 border-t border-amber-200/70">
                   <label className="block text-[11px] font-bold text-slate-700">
                     2. Mensaje predeterminado vía WhatsApp (editable):
@@ -1595,25 +1666,50 @@ export default function DashboardClient() {
             >
               <div>
                 <h2 className="text-base font-bold text-slate-900">
-                  Parámetros de Taxi Caldas
+                  Tarifas por Kilómetro y Parámetros Operativos
                 </h2>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  Teléfonos autorizados para comandos (/aprobar, /recargar) y tarifa de comisión
+                  Configura el cálculo automático de cotizaciones (Punto A → Punto B), comisiones y administradores
                 </p>
               </div>
 
               <div className="space-y-4">
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1">
-                    Teléfonos Administrador (con 57, separados por coma)
-                  </label>
-                  <input
-                    type="text"
-                    value={adminPhonesInput}
-                    onChange={(e) => setAdminPhonesInput(e.target.value)}
-                    placeholder="573133336835, 573001234567"
-                    className="w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm font-mono"
-                  />
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3.5">
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                      Banderazo / Base (COP)
+                    </label>
+                    <input
+                      type="number"
+                      value={baseFareInput}
+                      onChange={(e) => setBaseFareInput(e.target.value)}
+                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                      Valor por Km (COP/km)
+                    </label>
+                    <input
+                      type="number"
+                      value={pricePerKmInput}
+                      onChange={(e) => setPricePerKmInput(e.target.value)}
+                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                      Carrera Mínima (COP)
+                    </label>
+                    <input
+                      type="number"
+                      value={minFareInput}
+                      onChange={(e) => setMinFareInput(e.target.value)}
+                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono"
+                    />
+                  </div>
                 </div>
 
                 <div>
@@ -1624,6 +1720,19 @@ export default function DashboardClient() {
                     type="number"
                     value={commissionInput}
                     onChange={(e) => setCommissionInput(e.target.value)}
+                    className="w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm font-mono"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">
+                    Teléfonos Administrador (con 57, separados por coma)
+                  </label>
+                  <input
+                    type="text"
+                    value={adminPhonesInput}
+                    onChange={(e) => setAdminPhonesInput(e.target.value)}
+                    placeholder="573133336835, 573001234567"
                     className="w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm font-mono"
                   />
                 </div>
@@ -1640,7 +1749,7 @@ export default function DashboardClient() {
                 disabled={waLoading}
                 className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
               >
-                <Save className="h-4 w-4" /> Guardar Parámetros
+                <Save className="h-4 w-4" /> Guardar Tarifas y Parámetros
               </button>
             </form>
           </div>
@@ -1650,7 +1759,7 @@ export default function DashboardClient() {
       {/* Modal de Chat en Mobile / Tablet */}
       {selectedTrip && (
         <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-950/60 p-0 sm:p-4 lg:hidden">
-          <div className="w-full max-w-lg rounded-t-3xl sm:rounded-2xl bg-white shadow-2xl flex flex-col h-[82vh] overflow-hidden">
+          <div className="w-full max-w-lg rounded-t-3xl sm:rounded-2xl bg-white shadow-2xl flex flex-col h-[84vh] overflow-hidden">
             <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
               <span className="text-xs font-bold text-slate-900">
                 Chat Servicio #{selectedTrip.id}
@@ -1667,6 +1776,7 @@ export default function DashboardClient() {
                 trip={selectedTrip}
                 messages={chatMessages}
                 loading={loadingChat}
+                onSendCentral={handleSendCentralMessage}
               />
             </div>
           </div>
@@ -1723,7 +1833,7 @@ export default function DashboardClient() {
           }`}
         >
           <Smartphone className="h-5 w-5 mb-0.5" />
-          Línea
+          Tarifas
           <span
             className={`absolute top-1 right-4 h-2 w-2 rounded-full ${
               isConnected ? 'bg-emerald-500' : 'bg-red-500'
@@ -1739,24 +1849,58 @@ function ChatViewer({
   trip,
   messages,
   loading,
+  onSendCentral,
 }: {
   trip: Trip | null;
   messages: ChatMessage[];
   loading: boolean;
+  onSendCentral: (
+    tripId: number,
+    target: 'BOTH' | 'PASSENGER' | 'DRIVER',
+    message: string
+  ) => Promise<void>;
 }) {
+  const [replyText, setReplyText] = useState('');
+  const [targetRole, setTargetRole] = useState<'BOTH' | 'PASSENGER' | 'DRIVER'>(
+    'BOTH'
+  );
+  const [sending, setSending] = useState(false);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!trip || !replyText.trim()) return;
+    setSending(true);
+    try {
+      await onSendCentral(trip.id, targetRole, replyText.trim());
+      setReplyText('');
+    } finally {
+      setSending(false);
+    }
+  }
+
   return (
     <>
-      <div className="border-b border-slate-100 px-4 py-3">
+      <div className="border-b border-slate-100 px-4 py-3 space-y-1">
         <h3 className="font-bold text-sm text-slate-900">
           {trip
             ? `Auditoría Chat • Servicio #${trip.id}`
             : 'Selecciona un viaje'}
         </h3>
         {trip && (
-          <p className="text-[11px] text-slate-500 mt-0.5">
-            {trip.passenger_name || 'Pasajero'} ({trip.passenger_phone}) ↔ Taxi{' '}
-            {trip.driver_plate || 'N/A'}
-          </p>
+          <>
+            <p className="text-[11px] text-slate-500">
+              👤 Usuario: <strong>{trip.passenger_name || 'Sin nombre'}</strong> (
+              {trip.passenger_phone}) ↔ 🚕 Taxista:{' '}
+              <strong>{trip.driver_plate || 'N/A'}</strong>
+            </p>
+            {trip.dropoff_address && (
+              <p className="text-[11px] font-semibold text-emerald-700">
+                🏁 Destino: {trip.dropoff_address} • Valor aprox.: $
+                {Number(trip.estimated_fare || 0).toLocaleString('es-CO')} (
+                {trip.distance_km} km)
+              </p>
+            )}
+          </>
         )}
       </div>
 
@@ -1778,6 +1922,7 @@ function ChatViewer({
         )}
         {messages.map((m) => {
           const isPassenger = m.sender_role === 'PASSENGER';
+          const isCentral = m.sender_role === 'CENTRAL';
           const isSos = m.message_type === 'SOS';
           return (
             <div
@@ -1785,6 +1930,8 @@ function ChatViewer({
               className={`flex flex-col max-w-[85%] rounded-2xl px-3.5 py-2.5 text-xs shadow-sm ${
                 isSos
                   ? 'self-center mx-auto bg-red-600 text-white border border-red-700 font-bold'
+                  : isCentral
+                  ? 'self-center mx-auto bg-slate-900 text-amber-300 border border-slate-800'
                   : isPassenger
                   ? 'self-start bg-white border border-slate-200 text-slate-800'
                   : 'self-end ml-auto bg-amber-100 border border-amber-200 text-slate-900'
@@ -1794,13 +1941,19 @@ function ChatViewer({
                 <span className="font-bold">
                   {isSos
                     ? '🆘 ALERTA SOS'
+                    : isCentral
+                    ? '🚖 CENTRAL TAXI CALDAS'
                     : isPassenger
-                    ? '👤 Pasajero'
-                    : '🚕 Conductor'}
+                    ? '👤 USUARIO'
+                    : '🚕 TAXISTA'}
                 </span>
                 <span
                   className={`text-[10px] ${
-                    isSos ? 'text-red-100' : 'text-slate-500'
+                    isSos
+                      ? 'text-red-100'
+                      : isCentral
+                      ? 'text-slate-400'
+                      : 'text-slate-500'
                   }`}
                 >
                   {new Date(m.created_at).toLocaleTimeString('es-CO', {
@@ -1814,6 +1967,45 @@ function ChatViewer({
           );
         })}
       </div>
+
+      {/* Barra para enviar mensaje directo como CENTRAL TAXI CALDAS */}
+      {trip && (trip.status === 'ACTIVE' || trip.status === 'SEARCHING') && (
+        <form
+          onSubmit={handleSubmit}
+          className="border-t border-slate-200 bg-white p-2.5 space-y-2"
+        >
+          <div className="flex items-center gap-1.5 text-[11px]">
+            <span className="font-bold text-slate-600">Escribir como Central a:</span>
+            <select
+              value={targetRole}
+              onChange={(e) =>
+                setTargetRole(e.target.value as 'BOTH' | 'PASSENGER' | 'DRIVER')
+              }
+              className="rounded-lg border border-slate-300 bg-slate-50 px-2 py-1 text-[11px] font-semibold"
+            >
+              <option value="BOTH">Ambos (Usuario y Taxista)</option>
+              <option value="PASSENGER">Solo al Usuario</option>
+              <option value="DRIVER">Solo al Taxista</option>
+            </select>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <input
+              type="text"
+              value={replyText}
+              onChange={(e) => setReplyText(e.target.value)}
+              placeholder="Escribe un mensaje oficial de Taxi Caldas..."
+              className="flex-1 rounded-xl border border-slate-300 px-3 py-2 text-xs focus:border-amber-400 focus:outline-none"
+            />
+            <button
+              type="submit"
+              disabled={sending || !replyText.trim()}
+              className="inline-flex items-center gap-1 rounded-xl bg-slate-900 px-3 py-2 text-xs font-bold text-amber-400 hover:bg-slate-800 disabled:opacity-40"
+            >
+              <Send className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </form>
+      )}
     </>
   );
 }
