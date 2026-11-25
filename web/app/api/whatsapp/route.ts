@@ -28,18 +28,33 @@ async function evoFetch(endpoint: string, options: RequestInit = {}) {
 }
 
 async function ensureWebhook() {
-  await evoFetch(`/webhook/set/${INSTANCE}`, {
+  const v2Res = await evoFetch(`/webhook/set/${INSTANCE}`, {
     method: 'POST',
     body: JSON.stringify({
       webhook: {
         enabled: true,
         url: WEBHOOK_URL,
-        webhookByEvents: false,
-        webhookBase64: false,
+        byEvents: false,
+        base64: false,
         events: ['MESSAGES_UPSERT'],
       },
     }),
   });
+
+  if (!v2Res.ok) {
+    await evoFetch(`/webhook/set/${INSTANCE}`, {
+      method: 'POST',
+      body: JSON.stringify({
+        webhook: {
+          enabled: true,
+          url: WEBHOOK_URL,
+          webhookByEvents: false,
+          webhookBase64: false,
+          events: ['MESSAGES_UPSERT'],
+        },
+      }),
+    });
+  }
 }
 
 async function getSettingsMap(): Promise<Record<string, string>> {

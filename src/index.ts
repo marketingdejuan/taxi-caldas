@@ -169,14 +169,15 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
   try {
     const { event, data } = req.body;
-    if (event !== 'messages.upsert' || !data?.message) return;
+    console.log(`📩 Webhook evento: ${event}`);
+    if (String(event || "").toLowerCase() !== 'messages.upsert' || !data?.message) return;
 
     const rawJid: string = data.key?.remoteJid || '';
     if (rawJid.includes('@g.us') || rawJid === 'status@broadcast') return;
 
     const altJid: string = data.key?.remoteJidAlt || '';
     const effectiveJid = rawJid.endsWith('@lid') && altJid ? altJid : rawJid;
-    const from = effectiveJid.replace('@s.whatsapp.net', '').replace('@lid', '');
+    const from = effectiveJid.endsWith('@lid') ? effectiveJid : effectiveJid.replace('@s.whatsapp.net', '');
 
     const msg = data.message;
     const text = (msg.conversation || msg.extendedTextMessage?.text || '').trim();
@@ -190,7 +191,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
     const { centralPhone, adminPhones, tripCommission } = await getRuntimeConfig();
 
     const isFromMe = Boolean(data.key?.fromMe);
-    const isAdmin = adminPhones.includes(from);
+    const isAdmin = adminPhones.includes(from.replace('@lid', ''));
     const isSlashCommand = text.startsWith('/');
 
     if (isFromMe && !(isAdmin && isSlashCommand)) return;
