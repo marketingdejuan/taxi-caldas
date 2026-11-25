@@ -28,6 +28,9 @@ import {
   Users,
   Download,
   Search,
+  Trash2,
+  Copy,
+  Link2,
 } from 'lucide-react';
 
 interface Stats {
@@ -127,6 +130,7 @@ interface WhatsAppStatus {
     centralPhone: string;
     adminPhones: string;
     tripCommission: number;
+    driverInviteMessage?: string;
   };
 }
 
@@ -159,6 +163,7 @@ export default function DashboardClient() {
   const [topupAmounts, setTopupAmounts] = useState<Record<number, string>>({});
   const [bonusAmounts, setBonusAmounts] = useState<Record<number, string>>({});
   const [processingId, setProcessingId] = useState<number | null>(null);
+  const [deletingKey, setDeletingKey] = useState<string | null>(null);
 
   const [waStatus, setWaStatus] = useState<WhatsAppStatus | null>(null);
   const [qrCode, setQrCode] = useState<string | null>(null);
@@ -166,6 +171,10 @@ export default function DashboardClient() {
   const [waFeedback, setWaFeedback] = useState('');
   const [adminPhonesInput, setAdminPhonesInput] = useState('');
   const [commissionInput, setCommissionInput] = useState('500');
+  const [inviteMsgInput, setInviteMsgInput] = useState(
+    'Hola Taxi Caldas, soy taxista y quiero registrar mi vehículo'
+  );
+  const [copiedLabel, setCopiedLabel] = useState('');
   const [settingsSavedMsg, setSettingsSavedMsg] = useState('');
 
   const backendUrl =
@@ -188,6 +197,9 @@ export default function DashboardClient() {
           if (syncInputs && data.settings) {
             setAdminPhonesInput(data.settings.adminPhones);
             setCommissionInput(String(data.settings.tripCommission));
+            if (data.settings.driverInviteMessage) {
+              setInviteMsgInput(data.settings.driverInviteMessage);
+            }
           }
         }
       } catch (err) {
@@ -227,6 +239,38 @@ export default function DashboardClient() {
     return () => clearInterval(interval);
   }, [fetchData, fetchWhatsAppStatus]);
 
+  function copyText(value: string, label: string) {
+    navigator.clipboard.writeText(value);
+    setCopiedLabel(label);
+    setTimeout(() => setCopiedLabel(''), 2500);
+  }
+
+  async function handleDeleteProfile(
+    type: 'DRIVER' | 'PASSENGER',
+    id: number,
+    label: string
+  ) {
+    const confirmed = window.confirm(
+      `¿Seguro que deseas eliminar el perfil de ${label}? Esta acción liberará el número para volver a registrarlo desde cero.`
+    );
+    if (!confirmed) return;
+
+    const key = `${type}-${id}`;
+    setDeletingKey(key);
+    try {
+      const res = await fetch('/api/profiles/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type, id }),
+      });
+      if (res.ok) {
+        await fetchData();
+      }
+    } finally {
+      setDeletingKey(null);
+    }
+  }
+
   function exportPassengersCsv() {
     const headers = [
       'ID',
@@ -245,7 +289,9 @@ export default function DashboardClient() {
       `"${(p.push_name || '').replace(/"/g, '""')}"`,
       p.phone,
       p.data_consent ? 'AUTORIZADO' : 'PENDIENTE',
-      p.data_consent_at ? new Date(p.data_consent_at).toLocaleString('es-CO') : '',
+      p.data_consent_at
+        ? new Date(p.data_consent_at).toLocaleString('es-CO')
+        : '',
       p.trips_count,
       new Date(p.last_interaction_at).toLocaleString('es-CO'),
       new Date(p.created_at).toLocaleString('es-CO'),
@@ -338,8 +384,8 @@ export default function DashboardClient() {
     }
   }
 
-  async function handleSaveSettings(e: React.FormEvent) {
-    e.preventDefault();
+  async function handleSaveSettings(e?: React.FormEvent) {
+    if (e) e.preventDefault();
     setWaLoading(true);
     setSettingsSavedMsg('');
     try {
@@ -350,6 +396,7 @@ export default function DashboardClient() {
           action: 'SAVE_SETTINGS',
           adminPhones: adminPhonesInput,
           tripCommission: Number(commissionInput),
+          driverInviteMessage: inviteMsgInput,
         }),
       });
       if (res.ok) {
@@ -400,6 +447,17 @@ export default function DashboardClient() {
   const displayPhone =
     waStatus?.connectedPhone || waStatus?.settings?.centralPhone || '';
 
+  const siteOrigin =
+    typeof window !== 'undefined'
+      ? window.location.origin
+      : 'https://taxicaldas.ikiero.com';
+  const webDriverRegisterLink = `${siteOrigin}/registro-taxista`;
+  const waDriverInviteLink = displayPhone
+    ? `https://wa.me/${displayPhone.replace(/\D/g, '')}?text=${encodeURIComponent(
+        inviteMsgInput
+      )}`
+    : '';
+
   const filteredPassengers = passengers.filter((p) => {
     const q = clientSearch.toLowerCase().trim();
     if (!q) return true;
@@ -415,7 +473,7 @@ export default function DashboardClient() {
       {/* Barra Superior */}
       <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/95 backdrop-blur px-4 sm:px-6 py-3 shadow-sm">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-2">
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2.5">
             <TaxiCaldasLogo size="sm" theme="light" />
             <button
               onClick={() => setTab('WHATSAPP')}
@@ -430,6 +488,18 @@ export default function DashboardClient() {
                 {displayPhone ? `+${displayPhone}` : 'Sin línea'}
               </span>
             </button>
+            {waDriverInviteLink && (
+              <button
+                onClick={() => copyText(waDriverInviteLink, 'HEADER_WA')}
+                title="Copiar link de WhatsApp para registro de taxistas"
+                className="hidden xl:inline-flex items-center gap-1.5 rounded-full border border-amber-300 bg-amber-50 px-3 py-1 text-[11px] font-bold text-amber-900 hover:bg-amber-100"
+              >
+                <Link2 className="h-3.5 w-3.5 text-amber-600" />
+                {copiedLabel === 'HEADER_WA'
+                  ? '¡Link WA copiado!'
+                  : 'Link Registro Taxista'}
+              </button>
+            )}
           </div>
 
           {/* Navegación Desktop */}
@@ -535,7 +605,7 @@ export default function DashboardClient() {
             onClick={() => setTab('WHATSAPP')}
             className="font-bold text-amber-600 underline"
           >
-            {isConnected ? 'Desvincular / Cambiar' : 'Vincular QR'}
+            {isConnected ? 'Links / Línea' : 'Vincular QR'}
           </button>
         </div>
       </header>
@@ -708,7 +778,7 @@ export default function DashboardClient() {
               <LiveMap drivers={drivers} trips={trips} />
             </div>
 
-            <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm flex flex-col max-h-[480px]">
+            <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm flex flex-col max-h-[520px]">
               <h2 className="text-sm font-bold text-slate-900 mb-3">
                 Actividad Reciente ({trips.length})
               </h2>
@@ -877,7 +947,7 @@ export default function DashboardClient() {
                   Base de Datos de Clientes ({passengers.length})
                 </h2>
                 <p className="text-xs text-slate-500">
-                  Contactos capturados automáticamente por WhatsApp con su nombre y frecuencia de uso
+                  Contactos capturados automáticamente con autorización Habeas Data
                 </p>
               </div>
 
@@ -909,17 +979,31 @@ export default function DashboardClient() {
               </p>
             ) : (
               <>
-                {/* Tarjetas Mobile */}
                 <div className="divide-y divide-slate-100 md:hidden">
                   {filteredPassengers.map((p) => (
-                    <div key={p.id} className="p-4 space-y-1">
+                    <div key={p.id} className="p-4 space-y-1.5">
                       <div className="flex items-center justify-between">
                         <span className="font-bold text-sm text-slate-900">
                           {p.full_name || 'Sin nombre confirmado'}
                         </span>
-                        <span className="rounded-full bg-amber-100 px-2.5 py-0.5 text-[11px] font-bold text-amber-800">
-                          {p.trips_count} viajes
-                        </span>
+                        <div className="flex items-center gap-2">
+                          <span className="rounded-full bg-amber-100 px-2.5 py-0.5 text-[11px] font-bold text-amber-800">
+                            {p.trips_count} viajes
+                          </span>
+                          <button
+                            disabled={deletingKey === `PASSENGER-${p.id}`}
+                            onClick={() =>
+                              handleDeleteProfile(
+                                'PASSENGER',
+                                p.id,
+                                p.full_name || p.phone
+                              )
+                            }
+                            className="rounded-lg border border-red-200 bg-red-50 p-1.5 text-red-600"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
                       </div>
                       <p className="text-xs font-mono text-slate-600">{p.phone}</p>
                       <p className="text-[11px] text-slate-400">
@@ -930,7 +1014,6 @@ export default function DashboardClient() {
                   ))}
                 </div>
 
-                {/* Tabla PC */}
                 <div className="hidden md:block overflow-x-auto">
                   <table className="w-full text-left text-sm">
                     <thead className="bg-slate-50 text-xs uppercase text-slate-500">
@@ -941,7 +1024,7 @@ export default function DashboardClient() {
                         <th className="px-5 py-3">Habeas Data</th>
                         <th className="px-5 py-3">Servicios</th>
                         <th className="px-5 py-3">Última Interacción</th>
-                        <th className="px-5 py-3">Registrado</th>
+                        <th className="px-5 py-3 text-right">Acciones</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
@@ -986,8 +1069,21 @@ export default function DashboardClient() {
                           <td className="px-5 py-3 text-xs text-slate-600">
                             {new Date(p.last_interaction_at).toLocaleString('es-CO')}
                           </td>
-                          <td className="px-5 py-3 text-xs text-slate-500">
-                            {new Date(p.created_at).toLocaleDateString('es-CO')}
+                          <td className="px-5 py-3 text-right">
+                            <button
+                              disabled={deletingKey === `PASSENGER-${p.id}`}
+                              onClick={() =>
+                                handleDeleteProfile(
+                                  'PASSENGER',
+                                  p.id,
+                                  p.full_name || p.phone
+                                )
+                              }
+                              title="Eliminar perfil de cliente"
+                              className="inline-flex items-center gap-1 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1 text-xs font-semibold text-red-700 hover:bg-red-100 disabled:opacity-40"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" /> Eliminar
+                            </button>
                           </td>
                         </tr>
                       ))}
@@ -1003,12 +1099,26 @@ export default function DashboardClient() {
         {tab === 'DRIVERS' && (
           <div className="space-y-6">
             <div className="rounded-2xl border border-slate-200 bg-white p-4 sm:p-5 shadow-sm">
-              <h2 className="font-bold text-slate-900 mb-1">
-                Solicitudes Pendientes ({pendingDrivers.length})
-              </h2>
-              <p className="text-xs text-slate-500 mb-4">
-                Verifica el documento adjunto, asigna bono inicial y aprueba para activar al conductor.
-              </p>
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+                <div>
+                  <h2 className="font-bold text-slate-900">
+                    Solicitudes Pendientes ({pendingDrivers.length})
+                  </h2>
+                  <p className="text-xs text-slate-500">
+                    Verifica foto de perfil y documento, asigna bono inicial y aprueba.
+                  </p>
+                </div>
+
+                <button
+                  onClick={() => copyText(webDriverRegisterLink, 'DRIVERS_WEB')}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-bold text-amber-950 hover:bg-amber-100"
+                >
+                  <Copy className="h-3.5 w-3.5 text-amber-600" />
+                  {copiedLabel === 'DRIVERS_WEB'
+                    ? '¡Link formulario copiado!'
+                    : 'Copiar link formulario web'}
+                </button>
+              </div>
 
               {pendingDrivers.length === 0 ? (
                 <p className="rounded-xl bg-slate-50 p-6 text-center text-xs text-slate-500">
@@ -1037,26 +1147,28 @@ export default function DashboardClient() {
                           </p>
                         </div>
 
-                        {drv.profile_photo_path && (
-                          <a
-                            href={`${backendUrl}/${drv.profile_photo_path}`}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-amber-300 bg-amber-100/70 px-2.5 py-1.5 text-xs font-semibold text-amber-950 hover:bg-amber-100 mr-1.5"
-                          >
-                            Foto Perfil <ExternalLink className="h-3.5 w-3.5" />
-                          </a>
-                        )}
-                        {drv.doc_photo_path && (
-                          <a
-                            href={`${backendUrl}/${drv.doc_photo_path}`}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
-                          >
-                            Documento <ExternalLink className="h-3.5 w-3.5" />
-                          </a>
-                        )}
+                        <div className="flex flex-wrap justify-end gap-1.5">
+                          {drv.profile_photo_path && (
+                            <a
+                              href={`${backendUrl}/${drv.profile_photo_path}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-amber-300 bg-amber-100/70 px-2.5 py-1.5 text-xs font-semibold text-amber-950 hover:bg-amber-100"
+                            >
+                              Perfil <ExternalLink className="h-3.5 w-3.5" />
+                            </a>
+                          )}
+                          {drv.doc_photo_path && (
+                            <a
+                              href={`${backendUrl}/${drv.doc_photo_path}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                            >
+                              Doc <ExternalLink className="h-3.5 w-3.5" />
+                            </a>
+                          )}
+                        </div>
                       </div>
 
                       <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-amber-200/60">
@@ -1070,7 +1182,7 @@ export default function DashboardClient() {
                               [drv.id]: e.target.value,
                             })
                           }
-                          className="w-28 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs"
+                          className="w-24 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs"
                         />
                         <button
                           disabled={processingId === drv.id}
@@ -1088,9 +1200,23 @@ export default function DashboardClient() {
                         <button
                           disabled={processingId === drv.id}
                           onClick={() => handleDriverAction(drv.id, 'REJECT')}
-                          className="inline-flex items-center gap-1 rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-700 disabled:opacity-50"
+                          className="inline-flex items-center gap-1 rounded-lg bg-slate-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
                         >
                           <XCircle className="h-3.5 w-3.5" /> Rechazar
+                        </button>
+                        <button
+                          disabled={deletingKey === `DRIVER-${drv.id}`}
+                          onClick={() =>
+                            handleDeleteProfile(
+                              'DRIVER',
+                              drv.id,
+                              `${drv.full_name} (${drv.plate})`
+                            )
+                          }
+                          title="Eliminar perfil"
+                          className="inline-flex items-center gap-1 rounded-lg border border-red-300 bg-red-50 px-2.5 py-1.5 text-xs font-semibold text-red-700 hover:bg-red-100 disabled:opacity-40"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" /> Borrar
                         </button>
                       </div>
                     </div>
@@ -1114,9 +1240,24 @@ export default function DashboardClient() {
                         <span className="font-black text-sm mr-2">{drv.plate}</span>
                         <StatusBadge status={drv.status} />
                       </div>
-                      <span className="font-bold text-sm text-emerald-700">
-                        ${Number(drv.balance).toLocaleString('es-CO')}
-                      </span>
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-sm text-emerald-700">
+                          ${Number(drv.balance).toLocaleString('es-CO')}
+                        </span>
+                        <button
+                          disabled={deletingKey === `DRIVER-${drv.id}`}
+                          onClick={() =>
+                            handleDeleteProfile(
+                              'DRIVER',
+                              drv.id,
+                              `${drv.full_name} (${drv.plate})`
+                            )
+                          }
+                          className="rounded-lg border border-red-200 bg-red-50 p-1.5 text-red-600"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
                     </div>
                     <div className="text-xs text-slate-600">
                       {drv.full_name} • {drv.vehicle_model} • ⭐{' '}
@@ -1164,6 +1305,7 @@ export default function DashboardClient() {
                       <th className="px-4 py-3">Calificación</th>
                       <th className="px-4 py-3">Saldo</th>
                       <th className="px-4 py-3">Recarga Rápida</th>
+                      <th className="px-4 py-3 text-right">Eliminar</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
@@ -1222,6 +1364,22 @@ export default function DashboardClient() {
                             </button>
                           </div>
                         </td>
+                        <td className="px-4 py-3 text-right">
+                          <button
+                            disabled={deletingKey === `DRIVER-${drv.id}`}
+                            onClick={() =>
+                              handleDeleteProfile(
+                                'DRIVER',
+                                drv.id,
+                                `${drv.full_name} (${drv.plate})`
+                              )
+                            }
+                            title="Eliminar conductor"
+                            className="inline-flex items-center gap-1 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1 text-xs font-semibold text-red-700 hover:bg-red-100 disabled:opacity-40"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -1231,7 +1389,7 @@ export default function DashboardClient() {
           </div>
         )}
 
-        {/* VISTA 5: DESVINCULAR / CAMBIAR LÍNEA WHATSAPP */}
+        {/* VISTA 5: LÍNEA WHATSAPP, ENLACES DE REGISTRO DE TAXISTAS Y PARÁMETROS */}
         {tab === 'WHATSAPP' && (
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             <div className="rounded-2xl border border-slate-200 bg-white p-5 sm:p-6 shadow-sm space-y-5">
@@ -1241,7 +1399,7 @@ export default function DashboardClient() {
                     Gestión de Teléfono WhatsApp
                   </h2>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    Desliga el número actual o vincula uno nuevo para tus pruebas con clientes
+                    Desliga el número actual o vincula uno nuevo para tus pruebas
                   </p>
                 </div>
                 <span
@@ -1274,6 +1432,95 @@ export default function DashboardClient() {
                     <span className="font-semibold">{waStatus.profileName}</span>
                   </p>
                 )}
+              </div>
+
+              {/* Generador de Links de Invitación y Registro de Taxistas */}
+              <div className="rounded-2xl border border-amber-200 bg-amber-50/50 p-4 space-y-3.5">
+                <div>
+                  <h3 className="text-xs font-extrabold uppercase tracking-wide text-amber-950">
+                    Links de Registro para Taxistas
+                  </h3>
+                  <p className="text-[11px] text-amber-900/80 mt-0.5">
+                    Comparte cualquiera de estos dos enlaces para que los conductores creen su perfil:
+                  </p>
+                </div>
+
+                {/* 1. Link Formulario Web */}
+                <div className="space-y-1">
+                  <label className="block text-[11px] font-bold text-slate-700">
+                    1. Link directo Formulario Web (sin contraseña):
+                  </label>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="text"
+                      readOnly
+                      value={webDriverRegisterLink}
+                      className="flex-1 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-mono text-slate-700"
+                    />
+                    <button
+                      type="button"
+                      onClick={() =>
+                        copyText(webDriverRegisterLink, 'WEB_LINK')
+                      }
+                      className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800"
+                    >
+                      <Copy className="h-3.5 w-3.5" />
+                      {copiedLabel === 'WEB_LINK' ? 'Copiado' : 'Copiar'}
+                    </button>
+                  </div>
+                </div>
+
+                {/* 2. Mensaje Predeterminado + Link WhatsApp */}
+                <div className="space-y-1.5 pt-1 border-t border-amber-200/70">
+                  <label className="block text-[11px] font-bold text-slate-700">
+                    2. Mensaje predeterminado vía WhatsApp (editable):
+                  </label>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="text"
+                      value={inviteMsgInput}
+                      onChange={(e) => setInviteMsgInput(e.target.value)}
+                      className="flex-1 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs text-slate-800"
+                    />
+                    <button
+                      type="button"
+                      disabled={waLoading}
+                      onClick={() => handleSaveSettings()}
+                      className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-bold text-slate-700 hover:bg-slate-50"
+                    >
+                      <Save className="h-3.5 w-3.5" /> Guardar
+                    </button>
+                  </div>
+
+                  {waDriverInviteLink ? (
+                    <div className="flex flex-wrap items-center gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          copyText(waDriverInviteLink, 'WA_INVITE')
+                        }
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-emerald-700"
+                      >
+                        <Copy className="h-3.5 w-3.5" />
+                        {copiedLabel === 'WA_INVITE'
+                          ? '¡Link WhatsApp copiado!'
+                          : 'Copiar link WhatsApp'}
+                      </button>
+                      <a
+                        href={waDriverInviteLink}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 rounded-lg border border-emerald-300 bg-white px-3 py-1.5 text-xs font-bold text-emerald-800 hover:bg-emerald-50"
+                      >
+                        Probar link <ExternalLink className="h-3.5 w-3.5" />
+                      </a>
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-amber-800">
+                      Vincula primero un teléfono WhatsApp para activar el enlace directo `wa.me`.
+                    </p>
+                  )}
+                </div>
               </div>
 
               {waFeedback && (

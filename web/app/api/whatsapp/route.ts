@@ -9,6 +9,9 @@ const WEBHOOK_URL =
   process.env.BACKEND_WEBHOOK_URL ||
   'http://backend:4000/webhook/whatsapp';
 
+const DEFAULT_INVITE_MSG =
+  'Hola Taxi Caldas, soy taxista y quiero registrar mi vehículo';
+
 async function evoFetch(endpoint: string, options: RequestInit = {}) {
   const res = await fetch(`${EVOLUTION_URL}${endpoint}`, {
     ...options,
@@ -168,6 +171,8 @@ export async function GET() {
         centralPhone: settings.central_phone || '',
         adminPhones: settings.admin_phones || '573133336835',
         tripCommission: Number(settings.trip_commission || 500),
+        driverInviteMessage:
+          settings.driver_invite_message || DEFAULT_INVITE_MSG,
       },
     });
   } catch (error) {
@@ -187,7 +192,7 @@ export async function POST(req: NextRequest) {
 
   try {
     const body = await req.json();
-    const { action, adminPhones, tripCommission } = body;
+    const { action, adminPhones, tripCommission, driverInviteMessage } = body;
 
     if (action === 'SAVE_SETTINGS') {
       if (typeof adminPhones === 'string') {
@@ -211,6 +216,18 @@ export async function POST(req: NextRequest) {
            VALUES ('trip_commission', $1, NOW())
            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
           [String(Math.max(0, Number(tripCommission)))]
+        );
+      }
+
+      if (
+        typeof driverInviteMessage === 'string' &&
+        driverInviteMessage.trim().length > 0
+      ) {
+        await db.query(
+          `INSERT INTO app_settings (key, value, updated_at)
+           VALUES ('driver_invite_message', $1, NOW())
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+          [driverInviteMessage.trim()]
         );
       }
 

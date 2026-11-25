@@ -45,7 +45,7 @@ export async function ensureDatabaseSchema(db: Pool) {
     ALTER TABLE drivers ADD COLUMN IF NOT EXISTS data_consent_at TIMESTAMP WITH TIME ZONE;
 
     CREATE INDEX IF NOT EXISTS idx_drivers_location ON drivers USING GIST (location);
-    CREATE INDEX IF NOT EXISTS idx_drivers_status ON drivers USING GIST (location);
+    CREATE INDEX IF NOT EXISTS idx_drivers_status ON drivers (status);
 
     CREATE TABLE IF NOT EXISTS trips (
       id SERIAL PRIMARY KEY,
@@ -107,8 +107,9 @@ export async function ensureDatabaseSchema(db: Pool) {
     INSERT INTO app_settings (key, value) VALUES
       ('central_phone', '573133336835'),
       ('admin_phones', '573133336835'),
-      ('trip_commission', '500')
+      ('trip_commission', '500'),
+      ('driver_invite_message', 'Hola Taxi Caldas, soy taxista y quiero registrar mi vehículo')
     ON CONFLICT (key) DO NOTHING;
   `);
-  console.log('✅ Esquema PostGIS y columnas Habeas Data + Perfil verificados');
+  console.log('✅ Esquema PostGIS y tablas verificadas');
 }

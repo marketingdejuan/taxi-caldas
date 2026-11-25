@@ -53,6 +53,14 @@ function formatProperName(raw: string): string {
     .join(' ');
 }
 
+function normalizeColombianPhone(raw: string): string {
+  const digits = raw.replace(/\D/g, '');
+  if (!digits) return '';
+  if (digits.startsWith('57') && digits.length >= 12) return digits;
+  if (digits.length === 10 && digits.startsWith('3')) return `57${digits}`;
+  return digits;
+}
+
 function isConsentAccepted(upperText: string): boolean {
   const accepted = [
     'ACEPTO',
@@ -71,6 +79,64 @@ function isConsentRejected(upperText: string): boolean {
   return ['NO', 'NO ACEPTO', 'RECHAZO'].includes(upperText.trim());
 }
 
+function isAmbiguousTaxiOrDriverIntent(upperText: string): boolean {
+  const clean = upperText
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[¡!¿?.,]/g, '')
+    .trim();
+
+  if (!clean) return false;
+
+  const exactMatches = [
+    'TAXI',
+    'SOY TAXI',
+    'SOY TAXISTA',
+    'SOY CONDUCTOR',
+    'CONDUCTOR',
+    'TAXISTA',
+    'REGISTRO',
+    'REGISTRARME',
+    'AFILIAR',
+    'AFILIARME',
+    'TRABAJAR',
+    'QUIERO TRABAJAR',
+    'MANEJO TAXI',
+    'TENGO TAXI',
+    'UN TAXI',
+  ];
+  if (exactMatches.includes(clean)) return true;
+
+  if (
+    /\b(SOY TAXI|SOY TAXISTA|SOY CONDUCTOR|REGISTRAR MI VEHICULO|AFILIAR TAXI|TRABAJAR EN TAXI)\b/.test(
+      clean
+    )
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function isDriverWantingPassengerMode(upperText: string): boolean {
+  const clean = upperText
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[¡!¿?.,]/g, '')
+    .trim();
+
+  return [
+    'PEDIR TAXI',
+    'NECESITO UN TAXI',
+    'NECESITO TAXI',
+    'QUIERO UN TAXI',
+    'SOLICITAR TAXI',
+    'MODO PASAJERO',
+    'SOY PASAJERO',
+    'PEDIR SERVICIO',
+  ].includes(clean);
+}
+
 function isInvalidNameInput(text: string): boolean {
   const clean = text.trim();
   if (clean.length < 2 || clean.length > 45) return true;
@@ -83,6 +149,8 @@ function isInvalidNameInput(text: string): boolean {
     'BUENAS TARDES',
     'BUENAS NOCHES',
     'TAXI',
+    'SOY TAXI',
+    'SOY TAXISTA',
     'NECESITO',
     'NECESITO UN TAXI',
     'SERVICIO',
@@ -103,14 +171,17 @@ function calculateEtaEstimate(distanceMeters: number | null | undefined): {
   rangeText: string;
   distanceText: string;
 } {
-  if (distanceMeters == null || isNaN(Number(distanceMeters)) || Number(distanceMeters) <= 0) {
+  if (
+    distanceMeters == null ||
+    isNaN(Number(distanceMeters)) ||
+    Number(distanceMeters) <= 0
+  ) {
     return {
       rangeText: '5 a 8 minutos',
       distanceText: 'Cerca de tu ubicación',
     };
   }
   const dist = Math.round(Number(distanceMeters));
-  // Velocidad urbana promedio (~420 m/min) + margen de tráfico
   const minMins = Math.max(2, Math.round(dist / 420));
   const maxMins = minMins + 3;
   const distanceText =
@@ -156,7 +227,8 @@ async function findAvailableDriversInRadius(
   lat: number,
   radiusMeters: number,
   minBalance: number,
-  excludeDriverIds: number[] = []
+  excludeDriverIds: number[] = [],
+  excludePhone = ''
 ) {
   const res = await db.query(
     `SELECT id, phone, full_name,
@@ -166,11 +238,12 @@ async function findAvailableDriversInRadius(
        AND is_verified = TRUE
        AND approval_status = 'APPROVED'
        AND balance >= $3
+       AND phone <> $6
        AND ST_DWithin(location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $4)
        AND NOT (id = ANY($5::int[]))
      ORDER BY distance_meters ASC
      LIMIT 10`,
-    [lng, lat, minBalance, radiusMeters, excludeDriverIds]
+    [lng, lat, minBalance, radiusMeters, excludeDriverIds, excludePhone]
   );
   return res.rows;
 }
@@ -223,7 +296,8 @@ function scheduleExpandedSearch(
         lat,
         EXPANDED_RADIUS_METERS,
         tripCommission,
-        initialAlertedIds
+        initialAlertedIds,
+        passengerPhone
       );
 
       if (extraDrivers.length > 0) {
@@ -267,6 +341,216 @@ function scheduleExpandedSearch(
 app.get(['/', '/health'], (_req, res) =>
   res.json({ ok: true, service: 'taxi-caldas-backend' })
 );
+
+// Endpoint interno para borrar perfiles (conductores o clientes) y limpiar sesiones Redis
+app.post('/admin/delete-profile', async (req, res) => {
+  try {
+    const { type, id } = req.body;
+    const numericId = Number(id);
+    if (!numericId || !['DRIVER', 'PASSENGER'].includes(type)) {
+      res.status(400).json({ error: 'Parámetros inválidos' });
+      return;
+    }
+
+    if (type === 'DRIVER') {
+      const drvRes = await db.query(`SELECT * FROM drivers WHERE id = $1`, [
+        numericId,
+      ]);
+      const drv = drvRes.rows[0];
+      if (!drv) {
+        res.status(404).json({ error: 'Conductor no encontrado' });
+        return;
+      }
+
+      await redis.del(
+        `reg:${drv.phone}`,
+        `offer:${drv.phone}`,
+        `session:${drv.phone}`,
+        `driver_passenger_mode:${drv.phone}`,
+        `role_confirm:${drv.phone}`
+      );
+
+      for (const fileRel of [drv.profile_photo_path, drv.doc_photo_path]) {
+        if (fileRel) {
+          const abs = path.join(process.cwd(), fileRel);
+          if (fs.existsSync(abs)) {
+            try {
+              fs.unlinkSync(abs);
+            } catch {}
+          }
+        }
+      }
+
+      await db.query(`DELETE FROM wallet_transactions WHERE driver_id = $1`, [
+        numericId,
+      ]);
+      await db.query(`UPDATE trips SET driver_id = NULL WHERE driver_id = $1`, [
+        numericId,
+      ]);
+      await db.query(`DELETE FROM drivers WHERE id = $1`, [numericId]);
+
+      res.json({ ok: true });
+      return;
+    }
+
+    const passRes = await db.query(`SELECT * FROM passengers WHERE id = $1`, [
+      numericId,
+    ]);
+    const pass = passRes.rows[0];
+    if (!pass) {
+      res.status(404).json({ error: 'Cliente no encontrado' });
+      return;
+    }
+
+    await redis.del(
+      `consent_pending:${pass.phone}`,
+      `ask_name:${pass.phone}`,
+      `rate:${pass.phone}`,
+      `session:${pass.phone}`,
+      `role_confirm:${pass.phone}`
+    );
+    await db.query(`DELETE FROM passengers WHERE id = $1`, [numericId]);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Error en /admin/delete-profile:', err);
+    res.status(500).json({ error: 'Error eliminando perfil' });
+  }
+});
+
+// Endpoint público para registro web de taxistas (/registro-taxista)
+app.post('/public/driver-register', async (req, res) => {
+  try {
+    const {
+      fullName,
+      phone,
+      plate,
+      vehicleModel,
+      profilePhotoBase64,
+      docPhotoBase64,
+      dataConsent,
+    } = req.body;
+
+    if (!dataConsent) {
+      res.status(400).json({
+        error: 'Debes autorizar el tratamiento de datos personales (Ley 1581).',
+      });
+      return;
+    }
+
+    const cleanPhone = normalizeColombianPhone(String(phone || ''));
+    const cleanPlate = String(plate || '')
+      .toUpperCase()
+      .replace(/\s+/g, '');
+    const formattedName = formatProperName(String(fullName || ''));
+    const cleanModel = String(vehicleModel || '').trim();
+
+    if (
+      formattedName.length < 3 ||
+      cleanPhone.length < 10 ||
+      cleanPlate.length < 5 ||
+      cleanModel.length < 3 ||
+      !profilePhotoBase64 ||
+      !docPhotoBase64
+    ) {
+      res.status(400).json({
+        error:
+          'Completa todos los campos y adjunta tanto tu foto de perfil como la foto de tus documentos.',
+      });
+      return;
+    }
+
+    const dupPhone = await db.query(`SELECT id FROM drivers WHERE phone = $1`, [
+      cleanPhone,
+    ]);
+    if (dupPhone.rows.length > 0) {
+      res.status(409).json({
+        error: 'Este número de WhatsApp ya tiene un registro de conductor.',
+      });
+      return;
+    }
+
+    const dupPlate = await db.query(
+      `SELECT id FROM drivers WHERE UPPER(plate) = $1`,
+      [cleanPlate]
+    );
+    if (dupPlate.rows.length > 0) {
+      res.status(409).json({
+        error: `La placa ${cleanPlate} ya se encuentra registrada en el sistema.`,
+      });
+      return;
+    }
+
+    const stripBase64 = (b64: string) =>
+      b64.includes(',') ? b64.split(',')[1] : b64;
+
+    const rawProfileB64 = stripBase64(profilePhotoBase64);
+    const rawDocB64 = stripBase64(docPhotoBase64);
+
+    const profileFileName = `profile_${cleanPhone}_${Date.now()}.jpg`;
+    const docFileName = `doc_${cleanPhone}_${Date.now()}.jpg`;
+    const profileRelativePath = `uploads/drivers/${profileFileName}`;
+    const docRelativePath = `uploads/drivers/${docFileName}`;
+
+    fs.writeFileSync(
+      path.join(process.cwd(), profileRelativePath),
+      Buffer.from(rawProfileB64, 'base64')
+    );
+    fs.writeFileSync(
+      path.join(process.cwd(), docRelativePath),
+      Buffer.from(rawDocB64, 'base64')
+    );
+
+    await db.query(
+      `INSERT INTO drivers (
+         phone, full_name, plate, vehicle_model, status, is_verified,
+         approval_status, balance, profile_photo_path, doc_photo_path,
+         data_consent, data_consent_at
+       )
+       VALUES ($1, $2, $3, $4, 'OFFLINE', FALSE, 'PENDING', 0, $5, $6, TRUE, NOW())`,
+      [
+        cleanPhone,
+        formattedName,
+        cleanPlate,
+        cleanModel,
+        profileRelativePath,
+        docRelativePath,
+      ]
+    );
+
+    const { adminPhones } = await getRuntimeConfig();
+
+    try {
+      await sendText(
+        cleanPhone,
+        `✅ *¡Solicitud recibida en Taxi Caldas, ${formattedName}!*\n\n🔢 Placa: *${cleanPlate}*\n🚕 Vehículo: *${cleanModel}*\n📋 Habeas Data: *Autorizado*\n\nRecibimos tu formulario web con foto de perfil y documentos. Te avisaremos por aquí en cuanto tu cuenta sea aprobada.`
+      );
+    } catch (e) {
+      console.error('Aviso enviando confirmación WhatsApp web register:', e);
+    }
+
+    const adminPhone = adminPhones[0];
+    if (adminPhone) {
+      try {
+        const summary = `🌐🆕 *NUEVO TAXISTA REGISTRADO POR WEB*\n\n👤 Nombre: *${formattedName}*\n📱 Teléfono: *${cleanPhone}*\n🔢 Placa: *${cleanPlate}*\n🚕 Vehículo: *${cleanModel}*\n\nPara aprobarlo responde:\n*/aprobar ${cleanPlate} 5000*`;
+        await sendMedia(
+          adminPhone,
+          'image',
+          rawDocB64,
+          'image/jpeg',
+          summary
+        );
+      } catch (e) {
+        console.error('Aviso notificando admin web register:', e);
+      }
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Error en /public/driver-register:', err);
+    res.status(500).json({ error: 'Error procesando el registro web' });
+  }
+});
 
 app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => {
   res.sendStatus(200);
@@ -470,7 +754,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           `SELECT
              t.id AS trip_id,
              t.passenger_phone,
-             p.full_name AS passenger_name,
+             COALESCE(p.full_name, dp.full_name) AS passenger_name,
              ST_Y(t.pickup_location::geometry) AS pickup_lat,
              ST_X(t.pickup_location::geometry) AS pickup_lng,
              d.full_name AS driver_name,
@@ -482,6 +766,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
            FROM trips t
            LEFT JOIN drivers d ON t.driver_id = d.id
            LEFT JOIN passengers p ON t.passenger_phone = p.phone
+           LEFT JOIN drivers dp ON t.passenger_phone = dp.phone
            WHERE t.id = $1`,
           [session.tripId]
         );
@@ -580,7 +865,7 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
 
           await sendText(
             from,
-            '❌ *Has cancelado tu servicio.* Si necesitas un taxi más adelante, envíanos tu ubicación.'
+            '❌ *Has cancelado tu servicio.* Si necesitas otro taxi, envíanos tu ubicación.'
           );
           await sendText(
             session.peerPhone,
@@ -794,274 +1079,315 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       }
     }
 
-    // 2. FLUJO DE CONDUCTOR YA REGISTRADO EN BASE DE DATOS
+    // 2. FLUJO DE CONDUCTOR YA REGISTRADO (CON OPCIÓN DE PEDIR TAXI COMO PASAJERO)
     const driverRes = await db.query(`SELECT * FROM drivers WHERE phone = $1`, [
       from,
     ]);
-    if (driverRes.rows.length > 0) {
-      const driver = driverRes.rows[0];
+    const registeredDriver = driverRes.rows[0] || null;
+    const isDriverInPassengerMode = registeredDriver
+      ? Boolean(await redis.get(`driver_passenger_mode:${from}`))
+      : false;
+
+    if (registeredDriver) {
+      const driver = registeredDriver;
       const cmd = upperText;
 
-      if (!driver.is_verified || driver.approval_status !== 'APPROVED') {
+      if (
+        isDriverInPassengerMode &&
+        (cmd === 'MODO CONDUCTOR' || cmd === 'VOLVER A CONDUCTOR')
+      ) {
+        await redis.del(`driver_passenger_mode:${from}`);
         await sendText(
           from,
-          `⏳ Hola *${driver.full_name}*, tu registro para el vehículo *${driver.plate}* está en revisión. Te avisaremos por aquí en cuanto sea aprobado.`
+          `🚕 *Modo Conductor activado nuevamente, ${driver.full_name}.*\nEnvía tu *ubicación* (📎 -> Ubicación) o escribe *ACTIVO* para recibir servicios.`
         );
         return;
       }
 
-      if (cmd === 'SALDO' || cmd === 'BILLETERA') {
-        const txs = await db.query(
-          `SELECT amount, type, description, TO_CHAR(created_at, 'DD/MM HH24:MI') AS fecha
-           FROM wallet_transactions
-           WHERE driver_id = $1
-           ORDER BY created_at DESC
-           LIMIT 5`,
-          [driver.id]
-        );
-        const history =
-          txs.rows.length > 0
-            ? txs.rows
-                .map(
-                  (t) =>
-                    `• ${t.fecha}: *${t.amount >= 0 ? '+' : ''}${formatCOP(t.amount)}* (${t.description})`
-                )
-                .join('\n')
-            : 'Sin movimientos aún.';
-
-        await sendText(
-          from,
-          `💰 *Tu Billetera Prepago, ${driver.full_name}*\n\nSaldo actual: *${formatCOP(driver.balance)}*\nCalificación: *${driver.rating_avg || '5.00'} ⭐*\nComisión por servicio: *${formatCOP(tripCommission)}*\n\n*Últimos movimientos:*\n${history}\n\nPara recargar, transfiere vía Nequi/Llave al *${centralPhone.replace(/^57/, '')}* indicando tu placa *${driver.plate}*.`
-        );
-        return;
-      }
-
-      if (cmd === 'PAUSA') {
+      if (isDriverWantingPassengerMode(upperText)) {
         await db.query(`UPDATE drivers SET status = 'OFFLINE' WHERE id = $1`, [
           driver.id,
         ]);
+        await redis.set(`driver_passenger_mode:${from}`, '1', 'EX', 7200);
         await sendText(
           from,
-          `🔴 Turno pausado, *${driver.full_name}*. Escribe *ACTIVO* o envía tu ubicación cuando vuelvas a operar.`
+          `🙋 *Modo Pasajero activado, ${driver.full_name}.* Tu turno como conductor quedó en pausa.\n\n📍 Envíame la *ubicación GPS* (📎 -> Ubicación) donde necesitas que te recoja un taxi.\n_(Cuando termines, escribe *MODO CONDUCTOR* para volver a operar)_`
         );
         return;
       }
 
-      if (cmd === 'ACTIVO' || location) {
-        if (driver.balance < tripCommission) {
+      // Si el conductor NO está en modo pasajero ni tiene un viaje de pasajero buscando, atender comandos de conductor
+      const activePassengerTrip = await db.query(
+        `SELECT id FROM trips WHERE passenger_phone = $1 AND status IN ('SEARCHING', 'ACTIVE') LIMIT 1`,
+        [from]
+      );
+
+      if (!isDriverInPassengerMode && activePassengerTrip.rows.length === 0) {
+        if (!driver.is_verified || driver.approval_status !== 'APPROVED') {
           await sendText(
             from,
-            `⚠️ *Saldo insuficiente para operar*\n\nTu saldo actual es *${formatCOP(driver.balance)}* y el mínimo requerido por carrera es *${formatCOP(tripCommission)}*.\n\nRecarga tu cuenta vía Nequi/Llave al *${centralPhone.replace(/^57/, '')}* enviando tu placa *${driver.plate}*.`
-          );
-          return;
-        }
-      }
-
-      if (cmd === 'ACTIVO') {
-        await db.query(`UPDATE drivers SET status = 'AVAILABLE' WHERE id = $1`, [
-          driver.id,
-        ]);
-        await sendText(
-          from,
-          `🟢 Estás *DISPONIBLE*, *${driver.full_name}* (Saldo: *${formatCOP(driver.balance)}*).\nEnvíame tu ubicación actual (📎 -> Ubicación) para recibir servicios cercanos.`
-        );
-        return;
-      }
-
-      if (location) {
-        await db.query(
-          `UPDATE drivers SET location = ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, last_location_at = NOW(), status = 'AVAILABLE' WHERE id = $3`,
-          [location.degreesLongitude, location.degreesLatitude, driver.id]
-        );
-        await sendText(
-          from,
-          `📍 Ubicación GPS actualizada, *${driver.full_name}* (Saldo: *${formatCOP(driver.balance)}*). Buscando pasajeros cerca de ti...`
-        );
-        return;
-      }
-
-      const pendingTripId = await redis.get(`offer:${from}`);
-      if (pendingTripId && (cmd === '1' || cmd === 'YO')) {
-        if (driver.balance < tripCommission) {
-          await sendText(
-            from,
-            `⚠️ No tienes saldo suficiente (*${formatCOP(driver.balance)}*) para tomar esta carrera. Escribe *SALDO* para ver cómo recargar.`
+            `⏳ Hola *${driver.full_name}*, tu registro para el vehículo *${driver.plate}* está en revisión. Te avisaremos por aquí en cuanto sea aprobado.\n\n_(Si necesitas pedir un taxi como pasajero, escribe *PEDIR TAXI*)_`
           );
           return;
         }
 
-        const lock = await redis.set(
-          `trip:lock:${pendingTripId}`,
-          driver.id,
-          'EX',
-          3600,
-          'NX'
-        );
-        if (!lock) {
+        if (cmd === 'SALDO' || cmd === 'BILLETERA') {
+          const txs = await db.query(
+            `SELECT amount, type, description, TO_CHAR(created_at, 'DD/MM HH24:MI') AS fecha
+             FROM wallet_transactions
+             WHERE driver_id = $1
+             ORDER BY created_at DESC
+             LIMIT 5`,
+            [driver.id]
+          );
+          const history =
+            txs.rows.length > 0
+              ? txs.rows
+                  .map(
+                    (t) =>
+                      `• ${t.fecha}: *${t.amount >= 0 ? '+' : ''}${formatCOP(t.amount)}* (${t.description})`
+                  )
+                  .join('\n')
+              : 'Sin movimientos aún.';
+
           await sendText(
             from,
-            '⚠️ Lo sentimos, otro conductor acaba de tomar este servicio.'
+            `💰 *Tu Billetera Prepago, ${driver.full_name}*\n\nSaldo actual: *${formatCOP(driver.balance)}*\nCalificación: *${driver.rating_avg || '5.00'} ⭐*\nComisión por servicio: *${formatCOP(tripCommission)}*\n\n*Últimos movimientos:*\n${history}\n\nPara recargar, transfiere vía Nequi/Llave al *${centralPhone.replace(/^57/, '')}* indicando tu placa *${driver.plate}*.`
           );
           return;
         }
 
-        const client = await db.connect();
-        let newBalance = 0;
-        let trip: any = null;
-        let distanceMeters: number | null = null;
-
-        try {
-          await client.query('BEGIN');
-
-          const tripCheck = await client.query(
-            `SELECT id FROM trips WHERE id = $1 AND status = 'SEARCHING' FOR UPDATE`,
-            [pendingTripId]
+        if (cmd === 'PAUSA') {
+          await db.query(`UPDATE drivers SET status = 'OFFLINE' WHERE id = $1`, [
+            driver.id,
+          ]);
+          await sendText(
+            from,
+            `🔴 Turno pausado, *${driver.full_name}*. Escribe *ACTIVO* o envía tu ubicación cuando vuelvas a operar.`
           );
+          return;
+        }
 
-          if (tripCheck.rows.length === 0) {
-            await client.query('ROLLBACK');
-            await redis.del(`trip:lock:${pendingTripId}`, `offer:${from}`);
+        if (cmd === 'ACTIVO' || location) {
+          if (driver.balance < tripCommission) {
             await sendText(
               from,
-              '⚠️ Este servicio ya fue cancelado por el pasajero o tomado.'
+              `⚠️ *Saldo insuficiente para operar*\n\nTu saldo actual es *${formatCOP(driver.balance)}* y el mínimo requerido por carrera es *${formatCOP(tripCommission)}*.\n\nRecarga tu cuenta vía Nequi/Llave al *${centralPhone.replace(/^57/, '')}* enviando tu placa *${driver.plate}*.`
+            );
+            return;
+          }
+        }
+
+        if (cmd === 'ACTIVO') {
+          await db.query(`UPDATE drivers SET status = 'AVAILABLE' WHERE id = $1`, [
+            driver.id,
+          ]);
+          await sendText(
+            from,
+            `🟢 Estás *DISPONIBLE*, *${driver.full_name}* (Saldo: *${formatCOP(driver.balance)}*).\nEnvíame tu ubicación actual (📎 -> Ubicación) para recibir servicios cercanos.`
+          );
+          return;
+        }
+
+        if (location) {
+          await db.query(
+            `UPDATE drivers SET location = ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, last_location_at = NOW(), status = 'AVAILABLE' WHERE id = $3`,
+            [location.degreesLongitude, location.degreesLatitude, driver.id]
+          );
+          await sendText(
+            from,
+            `📍 Ubicación GPS actualizada, *${driver.full_name}* (Saldo: *${formatCOP(driver.balance)}*). Buscando pasajeros cerca de ti...`
+          );
+          return;
+        }
+
+        const pendingTripId = await redis.get(`offer:${from}`);
+        if (pendingTripId && (cmd === '1' || cmd === 'YO')) {
+          if (driver.balance < tripCommission) {
+            await sendText(
+              from,
+              `⚠️ No tienes saldo suficiente (*${formatCOP(driver.balance)}*) para tomar esta carrera. Escribe *SALDO* para ver cómo recargar.`
             );
             return;
           }
 
-          const balRes = await client.query(
-            `UPDATE drivers
-             SET balance = balance - $1, status = 'BUSY'
-             WHERE id = $2 AND balance >= $1
-             RETURNING balance`,
-            [tripCommission, driver.id]
+          const lock = await redis.set(
+            `trip:lock:${pendingTripId}`,
+            driver.id,
+            'EX',
+            3600,
+            'NX'
           );
+          if (!lock) {
+            await sendText(
+              from,
+              '⚠️ Lo sentimos, otro conductor acaba de tomar este servicio.'
+            );
+            return;
+          }
 
-          if (balRes.rows.length === 0) {
+          const client = await db.connect();
+          let newBalance = 0;
+          let trip: any = null;
+          let distanceMeters: number | null = null;
+
+          try {
+            await client.query('BEGIN');
+
+            const tripCheck = await client.query(
+              `SELECT id FROM trips WHERE id = $1 AND status = 'SEARCHING' FOR UPDATE`,
+              [pendingTripId]
+            );
+
+            if (tripCheck.rows.length === 0) {
+              await client.query('ROLLBACK');
+              await redis.del(`trip:lock:${pendingTripId}`, `offer:${from}`);
+              await sendText(
+                from,
+                '⚠️ Este servicio ya fue cancelado por el pasajero o tomado.'
+              );
+              return;
+            }
+
+            const balRes = await client.query(
+              `UPDATE drivers
+               SET balance = balance - $1, status = 'BUSY'
+               WHERE id = $2 AND balance >= $1
+               RETURNING balance`,
+              [tripCommission, driver.id]
+            );
+
+            if (balRes.rows.length === 0) {
+              await client.query('ROLLBACK');
+              await redis.del(`trip:lock:${pendingTripId}`);
+              await sendText(from, '⚠️ Saldo insuficiente para tomar el servicio.');
+              return;
+            }
+
+            newBalance = balRes.rows[0].balance;
+
+            const tripRes = await client.query(
+              `UPDATE trips
+               SET driver_id = $1, status = 'ACTIVE', accepted_at = NOW()
+               WHERE id = $2
+               RETURNING *,
+                 ST_Y(pickup_location::geometry) AS lat,
+                 ST_X(pickup_location::geometry) AS lng,
+                 (
+                   SELECT ROUND(ST_Distance(d.location, trips.pickup_location))
+                   FROM drivers d WHERE d.id = $1
+                 ) AS distance_meters`,
+              [driver.id, pendingTripId]
+            );
+            trip = tripRes.rows[0];
+            distanceMeters = trip.distance_meters;
+
+            await client.query(
+              `INSERT INTO wallet_transactions (driver_id, amount, type, trip_id, description)
+               VALUES ($1, $2, 'COMMISSION', $3, $4)`,
+              [driver.id, -tripCommission, trip.id, `Comisión servicio #${trip.id}`]
+            );
+
+            await client.query('COMMIT');
+          } catch (txErr) {
             await client.query('ROLLBACK');
             await redis.del(`trip:lock:${pendingTripId}`);
-            await sendText(from, '⚠️ Saldo insuficiente para tomar el servicio.');
-            return;
+            throw txErr;
+          } finally {
+            client.release();
           }
 
-          newBalance = balRes.rows[0].balance;
-
-          const tripRes = await client.query(
-            `UPDATE trips
-             SET driver_id = $1, status = 'ACTIVE', accepted_at = NOW()
-             WHERE id = $2
-             RETURNING *,
-               ST_Y(pickup_location::geometry) AS lat,
-               ST_X(pickup_location::geometry) AS lng,
-               (
-                 SELECT ROUND(ST_Distance(d.location, trips.pickup_location))
-                 FROM drivers d WHERE d.id = $1
-               ) AS distance_meters`,
-            [driver.id, pendingTripId]
-          );
-          trip = tripRes.rows[0];
-          distanceMeters = trip.distance_meters;
-
-          await client.query(
-            `INSERT INTO wallet_transactions (driver_id, amount, type, trip_id, description)
-             VALUES ($1, $2, 'COMMISSION', $3, $4)`,
-            [driver.id, -tripCommission, trip.id, `Comisión servicio #${trip.id}`]
-          );
-
-          await client.query('COMMIT');
-        } catch (txErr) {
-          await client.query('ROLLBACK');
-          await redis.del(`trip:lock:${pendingTripId}`);
-          throw txErr;
-        } finally {
-          client.release();
-        }
-
-        const [passRes, completedRes] = await Promise.all([
-          db.query(`SELECT full_name FROM passengers WHERE phone = $1`, [
-            trip.passenger_phone,
-          ]),
-          db.query(
-            `SELECT COUNT(*)::int AS total FROM trips WHERE driver_id = $1 AND status = 'COMPLETED'`,
-            [driver.id]
-          ),
-        ]);
-
-        const passengerName = passRes.rows[0]?.full_name || null;
-        const completedTrips = completedRes.rows[0]?.total || 0;
-        const eta = calculateEtaEstimate(distanceMeters);
-
-        await redis.del(`offer:${from}`);
-        await redis.set(
-          `session:${trip.passenger_phone}`,
-          JSON.stringify({ tripId: trip.id, role: 'PASSENGER', peerPhone: from }),
-          'EX',
-          7200
-        );
-        await redis.set(
-          `session:${from}`,
-          JSON.stringify({
-            tripId: trip.id,
-            role: 'DRIVER',
-            peerPhone: trip.passenger_phone,
-          }),
-          'EX',
-          7200
-        );
-
-        const passengerCardText =
-          `✅ *¡Taxi asignado${passengerName ? `, ${passengerName}` : ''}!*\n\n` +
-          `⏱️ *Tiempo estimado de llegada:* *${eta.rangeText}* (${eta.distanceText})\n\n` +
-          `👨‍✈️ *Perfil del Conductor:*\n` +
-          `• *Nombre:* ${driver.full_name}\n` +
-          `• *Calificación:* ${driver.rating_avg || '5.00'} ⭐ (${driver.rating_count || 0} calif.)\n` +
-          `• *Servicios completados:* ${completedTrips}\n` +
-          `• *Estado:* Verificado ✅\n\n` +
-          `🚕 *Datos del Vehículo:*\n` +
-          `• *Vehículo:* ${driver.vehicle_model}\n` +
-          `• *Placa:* *${driver.plate}*\n\n` +
-          `🔒 Tu número permanece privado. Puedes enviar mensajes, fotos o notas de voz por este chat.\n` +
-          `• Escribe *CANCELAR* para cancelar\n` +
-          `• Escribe *SOS* en caso de emergencia`;
-
-        let photoSent = false;
-        if (driver.profile_photo_path) {
-          const fullPhotoPath = path.join(
-            process.cwd(),
-            driver.profile_photo_path
-          );
-          if (fs.existsSync(fullPhotoPath)) {
-            const photoBase64 = fs.readFileSync(fullPhotoPath).toString('base64');
-            await sendMedia(
+          const [passRes, drvPassRes, completedRes] = await Promise.all([
+            db.query(`SELECT full_name FROM passengers WHERE phone = $1`, [
               trip.passenger_phone,
-              'image',
-              photoBase64,
-              'image/jpeg',
-              passengerCardText
-            );
-            photoSent = true;
-          }
-        }
+            ]),
+            db.query(`SELECT full_name FROM drivers WHERE phone = $1`, [
+              trip.passenger_phone,
+            ]),
+            db.query(
+              `SELECT COUNT(*)::int AS total FROM trips WHERE driver_id = $1 AND status = 'COMPLETED'`,
+              [driver.id]
+            ),
+          ]);
 
-        if (!photoSent) {
-          await sendText(trip.passenger_phone, passengerCardText);
+          const passengerName =
+            passRes.rows[0]?.full_name || drvPassRes.rows[0]?.full_name || null;
+          const completedTrips = completedRes.rows[0]?.total || 0;
+          const eta = calculateEtaEstimate(distanceMeters);
+
+          await redis.del(`offer:${from}`);
+          await redis.set(
+            `session:${trip.passenger_phone}`,
+            JSON.stringify({ tripId: trip.id, role: 'PASSENGER', peerPhone: from }),
+            'EX',
+            7200
+          );
+          await redis.set(
+            `session:${from}`,
+            JSON.stringify({
+              tripId: trip.id,
+              role: 'DRIVER',
+              peerPhone: trip.passenger_phone,
+            }),
+            'EX',
+            7200
+          );
+
+          const passengerCardText =
+            `✅ *¡Taxi asignado${passengerName ? `, ${passengerName}` : ''}!*\n\n` +
+            `⏱️ *Tiempo estimado de llegada:* *${eta.rangeText}* (${eta.distanceText})\n\n` +
+            `👨‍✈️ *Perfil del Conductor:*\n` +
+            `• *Nombre:* ${driver.full_name}\n` +
+            `• *Calificación:* ${driver.rating_avg || '5.00'} ⭐ (${driver.rating_count || 0} calif.)\n` +
+            `• *Servicios completados:* ${completedTrips}\n` +
+            `• *Estado:* Verificado ✅\n\n` +
+            `🚕 *Datos del Vehículo:*\n` +
+            `• *Vehículo:* ${driver.vehicle_model}\n` +
+            `• *Placa:* *${driver.plate}*\n\n` +
+            `🔒 Tu número permanece privado. Puedes enviar mensajes, fotos o notas de voz por este chat.\n` +
+            `• Escribe *CANCELAR* para cancelar\n` +
+            `• Escribe *SOS* en caso de emergencia`;
+
+          let photoSent = false;
+          if (driver.profile_photo_path) {
+            const fullPhotoPath = path.join(
+              process.cwd(),
+              driver.profile_photo_path
+            );
+            if (fs.existsSync(fullPhotoPath)) {
+              const photoBase64 = fs.readFileSync(fullPhotoPath).toString('base64');
+              await sendMedia(
+                trip.passenger_phone,
+                'image',
+                photoBase64,
+                'image/jpeg',
+                passengerCardText
+              );
+              photoSent = true;
+            }
+          }
+
+          if (!photoSent) {
+            await sendText(trip.passenger_phone, passengerCardText);
+          }
+
+          await sendText(
+            from,
+            `✅ *¡Servicio asignado a ti!*\n👤 Pasajero: *${passengerName || 'Cliente Taxi Caldas'}*\n⏱️ Tiempo estimado al punto: *${eta.rangeText}*\n💸 Comisión descontada: *-${formatCOP(tripCommission)}*\n💰 Saldo restante: *${formatCOP(newBalance)}*\n\nEscribe o envía audios/fotos por aquí para hablar con el pasajero.\n• *FIN* - Terminar viaje\n• *CANCELAR* - Cancelar servicio\n• *SOS* - Emergencia`
+          );
+          await sendLocation(from, trip.lat, trip.lng, 'Punto de recogida');
+          return;
         }
 
         await sendText(
           from,
-          `✅ *¡Servicio asignado a ti!*\n👤 Pasajero: *${passengerName || 'Cliente Taxi Caldas'}*\n⏱️ Tiempo estimado al punto: *${eta.rangeText}*\n💸 Comisión descontada: *-${formatCOP(tripCommission)}*\n💰 Saldo restante: *${formatCOP(newBalance)}*\n\nEscribe o envía audios/fotos por aquí para hablar con el pasajero.\n• *FIN* - Terminar viaje\n• *CANCELAR* - Cancelar servicio\n• *SOS* - Emergencia`
+          `🚕 Hola *${driver.full_name}* (*${driver.plate}*) | ${driver.rating_avg || '5.00'} ⭐\n\nComandos de conductor:\n• Envía tu *ubicación* (📎 -> Ubicación) para activar turno\n• *SALDO* - Ver saldo y movimientos\n• *PAUSA* - Pausar turno\n• *PEDIR TAXI* - Cambiar a modo pasajero para pedir un taxi`
         );
-        await sendLocation(from, trip.lat, trip.lng, 'Punto de recogida');
         return;
       }
-
-      await sendText(
-        from,
-        `🚕 Hola *${driver.full_name}* (*${driver.plate}*) | ${driver.rating_avg || '5.00'} ⭐\n\nComandos disponibles:\n• Envía tu *ubicación* (📎 -> Ubicación) para activar turno\n• *SALDO* - Ver saldo y movimientos\n• *PAUSA* - Pausar turno`
-      );
-      return;
     }
 
-    // 3. FLUJO DE AUTO-REGISTRO DE NUEVO TAXISTA CON HABEAS DATA Y FOTO DE PERFIL
+    // 3. CONFIRMACIÓN DE ROL (PASAJERO VS TAXISTA) Y AUTO-REGISTRO DE NUEVO TAXISTA
     const regRaw = await redis.get(`reg:${from}`);
 
     if (upperText === 'CANCELAR' && regRaw) {
@@ -1073,25 +1399,70 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
       return;
     }
 
-    if (
-      !regRaw &&
-      (upperText === 'SOY TAXISTA' ||
-        upperText === 'REGISTRO' ||
-        upperText === 'REGISTRARME')
-    ) {
-      await redis.del(`consent_pending:${from}`, `ask_name:${from}`);
-      await redis.set(
-        `reg:${from}`,
-        JSON.stringify({ step: 'ASK_CONSENT' }),
-        'EX',
-        1800
-      );
+    // Si está esperando confirmación de rol (1 = Pasajero, 2 = Taxista)
+    const pendingRoleConfirm = await redis.get(`role_confirm:${from}`);
+    if (pendingRoleConfirm && !regRaw) {
+      if (upperText === 'CANCELAR') {
+        await redis.del(`role_confirm:${from}`);
+        await sendText(from, '❌ Operación cancelada. Escríbenos *HOLA* cuando nos necesites.');
+        return;
+      }
+
+      if (
+        upperText === '2' ||
+        upperText === 'TAXISTA' ||
+        upperText === 'CONDUCTOR' ||
+        upperText === 'SOY TAXISTA' ||
+        upperText === 'SOY TAXI' ||
+        upperText === 'SOY CONDUCTOR'
+      ) {
+        await redis.del(`role_confirm:${from}`, `consent_pending:${from}`, `ask_name:${from}`);
+        await redis.set(
+          `reg:${from}`,
+          JSON.stringify({ step: 'ASK_CONSENT' }),
+          'EX',
+          1800
+        );
+        await sendText(
+          from,
+          '🚕 *Afiliación de Conductores - Taxi Caldas*\n\n' +
+            '📋 *Autorización de Tratamiento de Datos (Ley 1581 de 2012):*\n' +
+            'Para validar tu identidad, vehículo, documentos, foto de perfil y ubicación GPS durante los servicios, autorizas a *Taxi Caldas* el tratamiento de tus datos personales conforme a nuestra política de privacidad. Puedes conocer, actualizar o suprimir tus datos en cualquier momento.\n\n' +
+            '👉 Responde *ACEPTO* (o *1*) para iniciar tu registro, o *CANCELAR* para salir.'
+        );
+        return;
+      }
+
+      if (
+        upperText === '1' ||
+        upperText === 'PASAJERO' ||
+        upperText === 'USUARIO' ||
+        upperText === 'PEDIR' ||
+        upperText === 'PEDIR TAXI' ||
+        Boolean(location)
+      ) {
+        await redis.del(`role_confirm:${from}`);
+        // Continúa hacia el flujo de Pasajero (sección 4)
+      } else {
+        await sendText(
+          from,
+          '🚕 Por favor confírmame con un número qué deseas hacer:\n\n' +
+            '*1* 👉 Soy *PASAJERO* (quiero pedir un taxi)\n' +
+            '*2* 👉 Soy *CONDUCTOR / TAXISTA* (quiero registrar mi vehículo)'
+        );
+        return;
+      }
+    }
+
+    // Detectar palabras clave de taxi/taxista/registro y pedir confirmación previa
+    if (!regRaw && !registeredDriver && isAmbiguousTaxiOrDriverIntent(upperText)) {
+      await redis.set(`role_confirm:${from}`, '1', 'EX', 1800);
       await sendText(
         from,
-        '🚕 *Afiliación de Conductores - Taxi Caldas*\n\n' +
-          '📋 *Autorización de Tratamiento de Datos (Ley 1581 de 2012):*\n' +
-          'Para validar tu identidad, vehículo, documentos, foto de perfil y ubicación GPS durante los servicios, autorizas a *Taxi Caldas* el tratamiento de tus datos personales conforme a nuestra política de privacidad. Puedes conocer, actualizar o suprimir tus datos en cualquier momento.\n\n' +
-          '👉 Responde *ACEPTO* (o *1*) para iniciar tu registro, o *CANCELAR* para salir.'
+        '🚕 ¡Hola! Para atenderte correctamente en *Taxi Caldas*, confírmame por favor qué deseas hacer:\n\n' +
+          '*1* 👉 Soy *PASAJERO* (quiero pedir un taxi)\n' +
+          '*2* 👉 Soy *CONDUCTOR / TAXISTA* (quiero registrar mi vehículo para trabajar)\n\n' +
+          'Responde *1* o *2*.'
       );
       return;
     }
@@ -1283,85 +1654,112 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
     }
 
     // 4. VERIFICACIÓN PREVIA DE HABEAS DATA (LEY 1581 DE 2012) PARA CLIENTES / PASAJEROS
-    const passengerRes = await db.query(
-      `SELECT * FROM passengers WHERE phone = $1`,
-      [from]
-    );
-    let passenger = passengerRes.rows[0] || null;
-
-    if (upperText === 'ELIMINAR MIS DATOS' || upperText === 'REVOCAR DATOS') {
-      await db.query(`DELETE FROM passengers WHERE phone = $1`, [from]);
-      await redis.del(`consent_pending:${from}`, `ask_name:${from}`);
-      await sendText(
-        from,
-        '🗑️ Tus datos personales han sido eliminados de nuestra base de datos conforme a la Ley 1581 de 2012. Si deseas volver a usar *Taxi Caldas* más adelante, escríbenos *HOLA*.'
+    // (Si es un taxista en modo pasajero, ya aceptó Habeas Data al afiliarse y usa su propio nombre)
+    let passenger: any = null;
+    if (registeredDriver && isDriverInPassengerMode) {
+      passenger = {
+        full_name: registeredDriver.full_name,
+        data_consent: true,
+      };
+    } else {
+      const passengerRes = await db.query(
+        `SELECT * FROM passengers WHERE phone = $1`,
+        [from]
       );
-      return;
-    }
+      passenger = passengerRes.rows[0] || null;
 
-    if (!passenger || !passenger.data_consent) {
-      const pendingConsent = await redis.get(`consent_pending:${from}`);
+      if (upperText === 'ELIMINAR MIS DATOS' || upperText === 'REVOCAR DATOS') {
+        await db.query(`DELETE FROM passengers WHERE phone = $1`, [from]);
+        await redis.del(`consent_pending:${from}`, `ask_name:${from}`);
+        await sendText(
+          from,
+          '🗑️ Tus datos personales han sido eliminados de nuestra base de datos conforme a la Ley 1581 de 2012. Si deseas volver a usar *Taxi Caldas* más adelante, escríbenos *HOLA*.'
+        );
+        return;
+      }
 
-      if (pendingConsent) {
-        if (isConsentRejected(upperText)) {
-          await redis.del(`consent_pending:${from}`);
-          await sendText(
-            from,
-            'ℹ️ Entendido. Sin tu autorización de tratamiento de datos no podemos registrar tu perfil ni gestionar servicios en *Taxi Caldas*. Cuando desees autorizar, escríbenos *HOLA*.'
-          );
-          return;
-        }
+      if (!passenger || !passenger.data_consent) {
+        const pendingConsent = await redis.get(`consent_pending:${from}`);
 
-        if (isConsentAccepted(upperText)) {
-          const savedRes = await db.query(
-            `INSERT INTO passengers (phone, push_name, data_consent, data_consent_at, last_interaction_at)
-             VALUES ($1, $2, TRUE, NOW(), NOW())
-             ON CONFLICT (phone) DO UPDATE SET
-               push_name = COALESCE(NULLIF(EXCLUDED.push_name, ''), passengers.push_name),
-               data_consent = TRUE,
-               data_consent_at = NOW(),
-               last_interaction_at = NOW()
-             RETURNING *`,
-            [from, pushName || null]
-          );
-          passenger = savedRes.rows[0];
-          await redis.del(`consent_pending:${from}`);
-
-          if (!passenger.full_name) {
-            await redis.set(`ask_name:${from}`, '1', 'EX', 3600);
+        if (pendingConsent) {
+          if (upperText === '2') {
+            await redis.del(`consent_pending:${from}`);
+            await redis.set(
+              `reg:${from}`,
+              JSON.stringify({ step: 'ASK_CONSENT' }),
+              'EX',
+              1800
+            );
             await sendText(
               from,
-              '✅ *¡Autorización registrada!* Gracias por confiar en *Taxi Caldas*.\n\nPara brindarte una atención personalizada, ¿cuál es tu *nombre y apellido*? 😊'
+              '🚕 *Afiliación de Conductores - Taxi Caldas*\n\n' +
+                '📋 *Autorización de Tratamiento de Datos (Ley 1581 de 2012):*\n' +
+                'Para validar tu identidad, vehículo, documentos, foto de perfil y ubicación GPS durante los servicios, autorizas a *Taxi Caldas* el tratamiento de tus datos personales conforme a nuestra política de privacidad.\n\n' +
+                '👉 Responde *ACEPTO* (o *1*) para iniciar tu registro.'
+            );
+            return;
+          }
+
+          if (isConsentRejected(upperText)) {
+            await redis.del(`consent_pending:${from}`);
+            await sendText(
+              from,
+              'ℹ️ Entendido. Sin tu autorización de tratamiento de datos no podemos registrar tu perfil ni gestionar servicios en *Taxi Caldas*. Cuando desees autorizar, escríbenos *HOLA*.'
+            );
+            return;
+          }
+
+          if (isConsentAccepted(upperText)) {
+            const savedRes = await db.query(
+              `INSERT INTO passengers (phone, push_name, data_consent, data_consent_at, last_interaction_at)
+               VALUES ($1, $2, TRUE, NOW(), NOW())
+               ON CONFLICT (phone) DO UPDATE SET
+                 push_name = COALESCE(NULLIF(EXCLUDED.push_name, ''), passengers.push_name),
+                 data_consent = TRUE,
+                 data_consent_at = NOW(),
+                 last_interaction_at = NOW()
+               RETURNING *`,
+              [from, pushName || null]
+            );
+            passenger = savedRes.rows[0];
+            await redis.del(`consent_pending:${from}`);
+
+            if (!passenger.full_name) {
+              await redis.set(`ask_name:${from}`, '1', 'EX', 3600);
+              await sendText(
+                from,
+                '✅ *¡Autorización registrada!* Gracias por confiar en *Taxi Caldas*.\n\nPara brindarte una atención personalizada, ¿cuál es tu *nombre y apellido*? 😊'
+              );
+              return;
+            }
+          } else {
+            await sendText(
+              from,
+              '📋 Para continuar en *Taxi Caldas* y cumplir con la Ley 1581 de 2012 (Habeas Data), por favor responde *ACEPTO* (o *1*) autorizando el tratamiento de tus datos personales para pedir tu taxi.'
             );
             return;
           }
         } else {
+          await redis.set(`consent_pending:${from}`, '1', 'EX', 3600);
           await sendText(
             from,
-            '📋 Para continuar en *Taxi Caldas* y cumplir con la Ley 1581 de 2012 (Habeas Data), por favor responde *ACEPTO* (o *1*) autorizando el tratamiento de tus datos personales para gestionar tus servicios de taxi.'
+            '👋 ¡Hola! Bienvenido a *Taxi Caldas*.\n\n' +
+              '📋 *Aviso de Protección de Datos (Ley 1581 de 2012):*\n' +
+              'Para gestionar tu solicitud de taxi, seguridad GPS e historial de viajes, autorizas a *Taxi Caldas* el tratamiento de tus datos personales conforme a nuestra política de privacidad. Podrás conocer, actualizar o suprimir tus datos en cualquier momento.\n\n' +
+              '👉 Responde *ACEPTO* (o *1*) para pedir un taxi.\n' +
+              '🚕 Si eres conductor y deseas registrar tu vehículo, responde *2* o escribe *SOY TAXISTA*.'
           );
           return;
         }
       } else {
-        await redis.set(`consent_pending:${from}`, '1', 'EX', 3600);
-        await sendText(
-          from,
-          '👋 ¡Hola! Bienvenido a *Taxi Caldas*.\n\n' +
-            '📋 *Aviso de Protección de Datos (Ley 1581 de 2012):*\n' +
-            'Para gestionar tu solicitud de taxi, seguridad GPS e historial de viajes, autorizas a *Taxi Caldas* el tratamiento de tus datos personales conforme a nuestra política de privacidad. Podrás conocer, actualizar o suprimir tus datos en cualquier momento.\n\n' +
-            '👉 Responde *ACEPTO* (o *1*) para continuar.\n' +
-            '_(Si eres conductor y deseas afiliarte, escribe *SOY TAXISTA*)_'
+        await db.query(
+          `UPDATE passengers
+           SET push_name = COALESCE(NULLIF($2, ''), push_name),
+               last_interaction_at = NOW()
+           WHERE phone = $1`,
+          [from, pushName || null]
         );
-        return;
       }
-    } else {
-      await db.query(
-        `UPDATE passengers
-         SET push_name = COALESCE(NULLIF($2, ''), push_name),
-             last_interaction_at = NOW()
-         WHERE phone = $1`,
-        [from, pushName || null]
-      );
     }
 
     const passengerName: string | null = passenger?.full_name || null;
@@ -1472,7 +1870,9 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
         lng,
         lat,
         INITIAL_RADIUS_METERS,
-        tripCommission
+        tripCommission,
+        [],
+        from
       );
       let usedExpandedImmediately = false;
 
@@ -1481,7 +1881,9 @@ app.post(['/webhook/whatsapp', '/webhook/whatsapp/:event'], async (req, res) => 
           lng,
           lat,
           EXPANDED_RADIUS_METERS,
-          tripCommission
+          tripCommission,
+          [],
+          from
         );
         usedExpandedImmediately = true;
       }

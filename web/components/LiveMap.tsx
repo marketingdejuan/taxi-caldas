@@ -2,158 +2,183 @@
 
 import { useEffect, useRef } from 'react';
 import 'leaflet/dist/leaflet.css';
+import { Navigation } from 'lucide-react';
 
-interface DriverPoint {
+interface Driver {
   id: number;
   full_name: string;
   plate: string;
   vehicle_model: string;
   status: string;
-  balance: number;
   lat: number | null;
   lng: number | null;
 }
 
-interface TripPoint {
+interface Trip {
   id: number;
   passenger_phone: string;
+  passenger_name?: string | null;
   status: string;
-  driver_plate: string | null;
   lat: number | null;
   lng: number | null;
 }
+
+const CALDAS_CENTER: [number, number] = [6.091, -75.6357];
 
 export default function LiveMap({
   drivers,
   trips,
 }: {
-  drivers: DriverPoint[];
-  trips: TripPoint[];
+  drivers: Driver[];
+  trips: Trip[];
 }) {
-  const mapContainerRef = useRef<HTMLDivElement | null>(null);
-  const mapInstanceRef = useRef<any>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const mapRef = useRef<any>(null);
   const layerGroupRef = useRef<any>(null);
-  const hasCenteredRef = useRef(false);
 
   useEffect(() => {
     let mounted = true;
 
-    async function initMap() {
-      if (!mapContainerRef.current || mapInstanceRef.current) return;
+    async function initLeaflet() {
+      if (!containerRef.current || mapRef.current) return;
       const L = (await import('leaflet')).default;
-      if (!mounted) return;
+      if (!mounted || !containerRef.current) return;
 
-      const map = L.map(mapContainerRef.current).setView([6.2442, -75.5812], 13);
+      const map = L.map(containerRef.current, {
+        center: CALDAS_CENTER,
+        zoom: 14,
+        zoomControl: true,
+      });
 
-      L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
-        attribution: '&copy; OpenStreetMap &copy; CARTO',
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap • Taxi Caldas',
         maxZoom: 19,
       }).addTo(map);
 
-      layerGroupRef.current = L.layerGroup().addTo(map);
-      mapInstanceRef.current = map;
+      const group = L.layerGroup().addTo(map);
+      mapRef.current = map;
+      layerGroupRef.current = group;
+
+      setTimeout(() => {
+        if (mapRef.current) mapRef.current.invalidateSize();
+      }, 250);
     }
 
-    initMap();
+    initLeaflet();
 
     return () => {
       mounted = false;
-      if (mapInstanceRef.current) {
-        mapInstanceRef.current.remove();
-        mapInstanceRef.current = null;
+      if (mapRef.current) {
+        mapRef.current.remove();
+        mapRef.current = null;
+        layerGroupRef.current = null;
       }
     };
   }, []);
 
   useEffect(() => {
     async function renderMarkers() {
-      if (!mapInstanceRef.current || !layerGroupRef.current) return;
+      if (!mapRef.current || !layerGroupRef.current) return;
       const L = (await import('leaflet')).default;
-
-      layerGroupRef.current.clearLayers();
-      const bounds: [number, number][] = [];
+      const group = layerGroupRef.current;
+      group.clearLayers();
 
       drivers.forEach((drv) => {
         if (drv.lat == null || drv.lng == null) return;
-        bounds.push([drv.lat, drv.lng]);
-
-        const badgeColor =
-          drv.status === 'AVAILABLE'
-            ? '#10b981'
-            : drv.status === 'BUSY'
-            ? '#f59e0b'
-            : '#64748b';
+        const isAvailable = drv.status === 'AVAILABLE';
+        const isBusy = drv.status === 'BUSY';
+        const bgColor = isAvailable
+          ? '#10b981'
+          : isBusy
+          ? '#f59e0b'
+          : '#64748b';
 
         const icon = L.divIcon({
           className: 'custom-taxi-marker',
-          html: `<div style="background:${badgeColor};color:#fff;padding:3px 7px;border-radius:999px;font-size:11px;font-weight:700;border:2px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,0.35);white-space:nowrap;display:inline-flex;align-items:center;gap:3px;">🚕 ${drv.plate}</div>`,
-          iconSize: [76, 26],
-          iconAnchor: [38, 13],
+          html: `<div style="background:${bgColor};color:#fff;font-weight:800;font-size:10px;padding:3px 7px;border-radius:999px;border:2px solid #fff;box-shadow:0 3px 10px rgba(0,0,0,0.35);white-space:nowrap;">🚕 ${drv.plate}</div>`,
+          iconSize: [74, 24],
+          iconAnchor: [37, 12],
         });
 
-        L.marker([drv.lat, drv.lng], { icon })
+        L.marker([Number(drv.lat), Number(drv.lng)], { icon })
           .bindPopup(
-            `<div style="font-family:sans-serif;font-size:12px;line-height:1.4">
-              <strong>🚕 ${drv.plate}</strong> (${drv.status})<br/>
-              Conductor: ${drv.full_name}<br/>
-              Vehículo: ${drv.vehicle_model}<br/>
-              Saldo: $${Number(drv.balance).toLocaleString('es-CO')}
+            `<div style="font-family:sans-serif;font-size:12px;">
+              <strong>🚕 ${drv.plate}</strong><br/>
+              ${drv.full_name}<br/>
+              <span style="color:#64748b;">${drv.vehicle_model}</span><br/>
+              Estado: <strong>${isAvailable ? 'Disponible' : isBusy ? 'En carrera' : 'Desconectado'}</strong>
             </div>`
           )
-          .addTo(layerGroupRef.current);
+          .addTo(group);
       });
 
       trips
         .filter((t) => t.status === 'SEARCHING' || t.status === 'ACTIVE')
         .forEach((trip) => {
           if (trip.lat == null || trip.lng == null) return;
-          bounds.push([trip.lat, trip.lng]);
-
           const icon = L.divIcon({
-            className: 'custom-passenger-marker',
-            html: `<div style="background:#ef4444;color:#fff;padding:3px 7px;border-radius:999px;font-size:11px;font-weight:700;border:2px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,0.35);white-space:nowrap;">🙋 Viaje #${trip.id}</div>`,
-            iconSize: [74, 26],
-            iconAnchor: [37, 13],
+            className: 'custom-trip-marker',
+            html: `<div style="background:#ef4444;color:#fff;font-weight:800;font-size:10px;padding:3px 7px;border-radius:999px;border:2px solid #fff;box-shadow:0 3px 10px rgba(239,68,68,0.45);white-space:nowrap;">🙋 #${trip.id}</div>`,
+            iconSize: [54, 24],
+            iconAnchor: [27, 12],
           });
 
-          L.marker([trip.lat, trip.lng], { icon })
+          L.marker([Number(trip.lat), Number(trip.lng)], { icon })
             .bindPopup(
-              `<div style="font-family:sans-serif;font-size:12px;line-height:1.4">
+              `<div style="font-family:sans-serif;font-size:12px;">
                 <strong>🙋 Servicio #${trip.id}</strong><br/>
-                Estado: ${trip.status}<br/>
-                Pasajero: ${trip.passenger_phone}<br/>
-                Taxi: ${trip.driver_plate || 'Buscando...'}
+                ${trip.passenger_name || 'Pasajero'} (${trip.passenger_phone})<br/>
+                Estado: <strong>${trip.status}</strong>
               </div>`
             )
-            .addTo(layerGroupRef.current);
+            .addTo(group);
         });
-
-      if (bounds.length > 0 && !hasCenteredRef.current) {
-        mapInstanceRef.current.fitBounds(bounds, { padding: [50, 50], maxZoom: 15 });
-        hasCenteredRef.current = true;
-      }
     }
 
     renderMarkers();
   }, [drivers, trips]);
 
+  function centerCaldas() {
+    if (mapRef.current) {
+      mapRef.current.setView(CALDAS_CENTER, 14);
+      mapRef.current.invalidateSize();
+    }
+  }
+
+  const geolocatedDrivers = drivers.filter(
+    (d) => d.lat != null && d.lng != null
+  ).length;
+
   return (
-    <div className="relative h-[480px] w-full overflow-hidden rounded-xl border border-slate-200 bg-slate-100">
-      <div ref={mapContainerRef} className="h-full w-full z-0" />
-      <div className="absolute bottom-3 left-3 z-[400] flex flex-wrap gap-2 rounded-lg bg-white/95 px-3 py-2 text-xs font-medium text-slate-700 shadow-md backdrop-blur">
-        <span className="flex items-center gap-1.5">
-          <span className="h-2.5 w-2.5 rounded-full bg-emerald-500" /> Disponible
-        </span>
-        <span className="flex items-center gap-1.5">
-          <span className="h-2.5 w-2.5 rounded-full bg-amber-500" /> Ocupado
-        </span>
-        <span className="flex items-center gap-1.5">
-          <span className="h-2.5 w-2.5 rounded-full bg-slate-500" /> Desconectado
-        </span>
-        <span className="flex items-center gap-1.5">
-          <span className="h-2.5 w-2.5 rounded-full bg-red-500" /> Pasajero en curso
-        </span>
+    <div className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-3">
+        <div>
+          <h2 className="text-sm font-bold text-slate-900">
+            Mapa Operativo en Vivo • Caldas, Antioquia
+          </h2>
+          <p className="text-[11px] text-slate-500">
+            {geolocatedDrivers} vehículos con GPS activo •{' '}
+            <span className="text-emerald-600 font-semibold">● Libre</span>{' '}
+            <span className="text-amber-600 font-semibold">● Ocupado</span>{' '}
+            <span className="text-red-600 font-semibold">● Pasajero</span>
+          </p>
+        </div>
+
+        <button
+          type="button"
+          onClick={centerCaldas}
+          className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100"
+        >
+          <Navigation className="h-3.5 w-3.5 text-amber-500" />
+          Centrar en Caldas
+        </button>
       </div>
+
+      <div
+        ref={containerRef}
+        style={{ height: '460px', width: '100%' }}
+        className="z-10 bg-slate-100"
+      />
     </div>
   );
 }
