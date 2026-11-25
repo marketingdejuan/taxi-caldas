@@ -172,6 +172,12 @@ app.post('/webhook/whatsapp', async (req, res) => {
     console.log(`📩 Webhook evento: ${event}`);
     if (String(event || "").toLowerCase() !== 'messages.upsert' || !data?.message) return;
 
+    const msgId = data.key?.id;
+    if (msgId) {
+      const isFirst = await redis.set(`dedup:msg:${msgId}`, "1", "EX", 60, "NX");
+      if (!isFirst) return;
+    }
+
     const rawJid: string = data.key?.remoteJid || '';
     if (rawJid.includes('@g.us') || rawJid === 'status@broadcast') return;
 
