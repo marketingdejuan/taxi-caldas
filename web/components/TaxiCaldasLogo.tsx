@@ -1,65 +1,76 @@
 export default function TaxiCaldasLogo({
   size = 'md',
-  darkText = true,
+  theme = 'dark',
 }: {
   size?: 'sm' | 'md' | 'lg';
-  darkText?: boolean;
+  theme?: 'dark' | 'light';
 }) {
-  const iconDim = size === 'sm' ? 'h-9 w-9' : size === 'lg' ? 'h-14 w-14' : 'h-10 w-10';
+  const boxClass =
+    size === 'sm'
+      ? 'h-9 w-9 rounded-xl'
+      : size === 'lg'
+      ? 'h-12 w-12 rounded-2xl'
+      : 'h-10 w-10 rounded-xl';
+
+  const svgPx = size === 'sm' ? 22 : size === 'lg' ? 28 : 24;
+
+  const titleClass =
+    size === 'sm'
+      ? 'text-base'
+      : size === 'lg'
+      ? 'text-xl'
+      : 'text-lg';
+
+  const isLightText = theme === 'dark';
 
   return (
-    <div className="inline-flex items-center gap-2.5 select-none">
+    <div className="inline-flex items-center gap-3 select-none">
       <div
-        className={`${iconDim} relative flex shrink-0 items-center justify-center rounded-xl bg-slate-900 p-1.5 shadow-md ring-2 ring-amber-400`}
+        className={`${boxClass} flex shrink-0 items-center justify-center bg-gradient-to-br from-amber-300 via-amber-400 to-amber-500 text-slate-950 shadow-md shadow-amber-500/20 ring-1 ring-amber-300/60`}
       >
-        <svg viewBox="0 0 64 64" className="h-full w-full">
-          {/* Letrero superior */}
-          <rect x="22" y="6" width="20" height="7" rx="2" fill="#facc15" />
+        <svg
+          width={svgPx}
+          height={svgPx}
+          viewBox="0 0 24 24"
+          fill="none"
+          xmlns="http://www.w3.org/2000/svg"
+          className="shrink-0"
+        >
+          {/* Letrero TAXI superior */}
+          <rect x="8.5" y="2.5" width="7" height="2.5" rx="1" fill="#0f172a" />
           {/* Cabina */}
           <path
-            d="M14 28 L20 14 C21 12 23 11 25 11 L39 11 C41 11 43 12 44 14 L50 28 Z"
-            fill="#facc15"
+            d="M5.2 10.5L6.8 6.2C7.1 5.5 7.8 5 8.6 5H15.4C16.2 5 16.9 5.5 17.2 6.2L18.8 10.5H5.2Z"
+            fill="#0f172a"
           />
-          <path d="M19 26 L23 16 L41 16 L45 26 Z" fill="#0f172a" />
-          {/* Carroceria */}
-          <rect x="8" y="27" width="48" height="22" rx="6" fill="#facc15" />
-          {/* Franja ajedrezada */}
-          <rect x="12" y="36" width="40" height="5" fill="#0f172a" />
-          <rect x="14" y="36.5" width="4" height="2" fill="#facc15" />
-          <rect x="22" y="36.5" width="4" height="2" fill="#facc15" />
-          <rect x="30" y="36.5" width="4" height="2" fill="#facc15" />
-          <rect x="38" y="36.5" width="4" height="2" fill="#facc15" />
-          <rect x="46" y="36.5" width="4" height="2" fill="#facc15" />
-          <rect x="18" y="38.5" width="4" height="2" fill="#facc15" />
-          <rect x="26" y="38.5" width="4" height="2" fill="#facc15" />
-          <rect x="34" y="38.5" width="4" height="2" fill="#facc15" />
-          <rect x="42" y="38.5" width="4" height="2" fill="#facc15" />
-          {/* Faros */}
-          <circle cx="15" cy="32" r="2.8" fill="#ffffff" />
-          <circle cx="49" cy="32" r="2.8" fill="#ffffff" />
+          {/* Carrocería */}
+          <rect x="3" y="10" width="18" height="7.5" rx="2.5" fill="#0f172a" />
+          {/* Faros amarillos */}
+          <circle cx="6.2" cy="13.5" r="1.3" fill="#facc15" />
+          <circle cx="17.8" cy="13.5" r="1.3" fill="#facc15" />
+          {/* Parrilla ajedrezada */}
+          <rect x="9.5" y="12.6" width="5" height="1.8" rx="0.6" fill="#facc15" />
           {/* Llantas */}
-          <rect x="13" y="48" width="9" height="8" rx="2" fill="#020617" />
-          <rect x="42" y="48" width="9" height="8" rx="2" fill="#020617" />
+          <rect x="4.8" y="17.2" width="3.2" height="2.8" rx="1" fill="#0f172a" />
+          <rect x="16" y="17.2" width="3.2" height="2.8" rx="1" fill="#0f172a" />
         </svg>
       </div>
 
-      <div className="leading-tight">
-        <div className="flex items-center gap-1.5">
-          <span
-            className={`font-black tracking-tight ${
-              size === 'lg' ? 'text-2xl' : 'text-base sm:text-lg'
-            } ${darkText ? 'text-slate-900' : 'text-white'}`}
-          >
-            TAXI <span className="text-amber-500">CALDAS</span>
-          </span>
-        </div>
-        <p
-          className={`text-[11px] font-medium ${
-            darkText ? 'text-slate-500' : 'text-slate-400'
+      <div className="flex flex-col leading-none">
+        <span
+          className={`${titleClass} font-extrabold tracking-tight ${
+            isLightText ? 'text-white' : 'text-slate-900'
           }`}
         >
-          Central de Despacho
-        </p>
+          Taxi <span className="text-amber-400">Caldas</span>
+        </span>
+        <span
+          className={`mt-1 text-[10px] font-semibold uppercase tracking-widest ${
+            isLightText ? 'text-slate-400' : 'text-slate-500'
+          }`}
+        >
+          Central Operativa
+        </span>
       </div>
     </div>
   );
